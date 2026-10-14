@@ -4,8 +4,133 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PDF-Editor</title>
+  <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-  <h1>Testseite</h1>
+  <header class="topbar">
+    <div class="brand">PDF-Editor</div>
+    <div class="group">
+      <button id="btnOpen" title="PDF oder Projektdatei öffnen (Strg+O)">Öffnen</button>
+      <button id="btnSave" title="Speichern (Strg+S)" disabled>Speichern</button>
+      <button id="btnSaveAs" title="Speichern unter … (Strg+Umschalt+S)" disabled>Speichern unter …</button>
+    </div>
+    <div class="group">
+      <button id="btnUndo" title="Rückgängig (Strg+Z)" disabled>↶</button>
+      <button id="btnRedo" title="Wiederholen (Strg+Y)" disabled>↷</button>
+    </div>
+    <div class="group tools" id="tools">
+      <button data-tool="select" class="active" title="Auswählen: Element anklicken oder Bereich aufziehen (V)">Auswählen</button>
+      <button data-tool="text" title="Neuen Text einfügen (T)">Text</button>
+      <button id="btnImage" title="Bild oder Unterschrift als Bild einfügen">Bild</button>
+      <button id="btnSign" title="Unterschrift zeichnen">Unterschrift</button>
+    </div>
+    <div class="group">
+      <button id="btnWm" title="Wasserzeichen automatisch suchen und markieren">Wasserzeichen finden</button>
+      <label class="toggle" title="Alle erkannten Elemente umrahmen"><input type="checkbox" id="chkShow" checked> Elemente zeigen</label>
+    </div>
+    <div class="group zoom">
+      <button id="btnZoomOut" title="Verkleinern">−</button>
+      <span id="zoomLabel">100 %</span>
+      <button id="btnZoomIn" title="Vergrößern">+</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="side-head">
+        <span>Dokumente</span>
+        <button id="btnAdd" class="small" title="Weitere PDF öffnen">+</button>
+      </div>
+      <ul id="docList" class="doc-list"></ul>
+      <div class="legend">
+        <div><i class="sw text"></i> Text</div>
+        <div><i class="sw image"></i> Bild / Logo</div>
+        <div><i class="sw path"></i> Linie / Grafik</div>
+        <div><i class="sw annot"></i> Stempel / Feld</div>
+        <div><i class="sw wm"></i> Wasserzeichen?</div>
+      </div>
+      <div class="hint">
+        <b>Tipps</b><br>
+        Klick = auswählen · Doppelklick auf Text = ändern<br>
+        Rahmen aufziehen = mehrere auswählen<br>
+        Entf = löschen · Umschalt+Klick = dazunehmen
+      </div>
+    </aside>
+
+    <main id="main" class="main">
+      <div id="empty" class="empty">
+        <div class="drop">
+          <div class="drop-icon">📄</div>
+          <p><b>PDF hier ablegen</b> oder klicken zum Auswählen</p>
+          <p class="muted">Deine Dateien bleiben in deinem Browser – es wird nichts hochgeladen.</p>
+        </div>
+      </div>
+      <div id="docs"></div>
+    </main>
+  </div>
+
+  <div id="ctxbar" class="ctxbar hidden"></div>
+  <div id="busy" class="busy hidden"><div class="spinner"></div><span id="busyText">Analysiere …</span></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <input type="file" id="fileInput" accept=".pdf,.pdfprojekt,application/pdf" multiple hidden>
+  <input type="file" id="imgInput" accept="image/*" hidden>
+
+  <!-- Bild einfügen -->
+  <dialog id="dlgImage">
+    <form method="dialog">
+      <h3>Bild einfügen</h3>
+      <div class="imgprev"><canvas id="imgPrev"></canvas></div>
+      <label><input type="checkbox" id="chkWhite" checked> Weißen Hintergrund entfernen (gut für eingescannte Unterschriften)</label>
+      <div class="actions">
+        <button value="cancel">Abbrechen</button>
+        <button value="ok" class="primary">Einfügen</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Unterschrift zeichnen -->
+  <dialog id="dlgSign">
+    <form method="dialog">
+      <h3>Unterschrift zeichnen</h3>
+      <canvas id="signPad" width="600" height="200"></canvas>
+      <div class="row">
+        <label>Farbe <input type="color" id="signColor" value="#1a2f8a"></label>
+        <label>Stärke <input type="range" id="signWidth" min="1" max="6" value="2.5" step="0.5"></label>
+        <button type="button" id="signClear">Leeren</button>
+      </div>
+      <div class="actions">
+        <button value="cancel">Abbrechen</button>
+        <button value="ok" class="primary">Einfügen</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Speichern unter -->
+  <dialog id="dlgSave">
+    <form method="dialog">
+      <h3>Speichern unter</h3>
+      <label class="field">Dateiname <input type="text" id="saveName"></label>
+      <div class="formats">
+        <label><input type="radio" name="fmt" value="pdf" checked><span><b>PDF</b><small>Empfohlen – sieht exakt so aus wie im Editor</small></span></label>
+        <label><input type="radio" name="fmt" value="docx"><span><b>Word (.docx)</b><small>Text bleibt in Word bearbeitbar, Layout ähnlich</small></span></label>
+        <label><input type="radio" name="fmt" value="png"><span><b>Bild (PNG)</b><small>Eine Datei pro Seite, mehrere Seiten als ZIP</small></span></label>
+        <label><input type="radio" name="fmt" value="jpg"><span><b>Bild (JPG)</b><small>Kleiner als PNG</small></span></label>
+        <label><input type="radio" name="fmt" value="pdfprojekt"><span><b>Projektdatei (.pdfprojekt)</b><small>Zwischenstand – später hier wieder öffnen und weiterbearbeiten</small></span></label>
+      </div>
+      <div class="actions">
+        <button value="cancel">Abbrechen</button>
+        <button value="ok" class="primary">Speichern</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="vendor/pdfjs/pdf.min.js"></script>
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script src="vendor/jszip.min.js"></script>
+  <script src="vendor/docx.umd.js"></script>
+  <script src="js/pdfscan.js"></script>
+  <script src="js/export.js"></script>
+  <script src="js/app.js"></script>
 </body>
 </html>
