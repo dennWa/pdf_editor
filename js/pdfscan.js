@@ -390,7 +390,29 @@
     return { bold, italic, family, name: name || null };
   }
 
-  function loadFont(ctx, fontDict) {
+  function stdFontName(style) {
+    const b = style.bold, i = style.italic;
+    if (style.family === 'serif') return b && i ? 'Times-BoldItalic' : b ? 'Times-Bold' : i ? 'Times-Italic' : 'Times-Roman';
+    if (style.family === 'mono') return b && i ? 'Courier-BoldOblique' : b ? 'Courier-Bold' : i ? 'Courier-Oblique' : 'Courier';
+    return b && i ? 'Helvetica-BoldOblique' : b ? 'Helvetica-Bold' : i ? 'Helvetica-Oblique' : 'Helvetica';
+  }
+
+  // Metriken der 12 Standardschriften (für PDFs ohne Breitenangaben)
+  let stdCache = null;
+  async function standardFonts() {
+    if (stdCache) return stdCache;
+    const L = lib();
+    const d = await L.PDFDocument.create();
+    const out = {};
+    for (const n of ['Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique', 'Helvetica-BoldOblique', 'Times-Roman',
+      'Times-Bold', 'Times-Italic', 'Times-BoldItalic', 'Courier', 'Courier-Bold', 'Courier-Oblique', 'Courier-BoldOblique']) {
+      out[n] = d.embedStandardFont(n);
+    }
+    stdCache = out;
+    return out;
+  }
+
+  function loadFont(ctx, fontDict, std) {
     const L = lib();
     const subtype = nameOf(get(ctx, fontDict, 'Subtype'));
     const baseFont = nameOf(get(ctx, fontDict, 'BaseFont')) || '';
@@ -468,6 +490,8 @@
         }
       }
     }
+    f.subset = /^[A-Z]{6}\+/.test(baseFont);
+    f.embedded = descriptor instanceof L.PDFDict && ['FontFile', 'FontFile2', 'FontFile3'].some(k => descriptor.has(N(k)));
     if (descriptor instanceof L.PDFDict) {
       f.missing = num(get(ctx, descriptor, 'MissingWidth'), 0);
       const a = num(get(ctx, descriptor, 'Ascent'), 0);
@@ -479,6 +503,11 @@
       if (flags & 1) f.style.family = 'mono';
       if (flags & (1 << 6)) f.style.italic = true;
       if (flags & (1 << 18)) f.style.bold = true;
+    }
+    if (!f.hasWidths && !f.type0 && !f.type3 && std) {
+      f.std = std[stdFontName(f.style)];
+      f.stdW = new Map();
+      if (f.std) f.hasWidths = true;
     }
     return f;
   }
@@ -499,6 +528,14 @@
       const w = font.widths[code - font.firstChar];
       return w === undefined ? font.missing : w;
     }
+    if (font.std) {
+      if (!font.stdW.has(code)) {
+        let w = 500;
+        try { const ch = codeText(font, code); w = ch ? font.std.widthOfTextAtSize(ch, 1000) : 0; } catch (e) { w = 500; }
+        font.stdW.set(code, w);
+      }
+      return font.stdW.get(code);
+    }
     return 500;
   }
 
@@ -509,6 +546,45 @@
     if (code >= 0x80 && code <= 0x9F) return WIN_ANSI_HIGH[code] || '';
     if (code < 32) return '';
     return String.fromCharCode(code);
+  }
+
+  // Ist der Code in der (evtl. nur teilweise eingebetteten) Schrift vorhanden?
+  function codeAvailable(f, c) {
+    if (f.type0) return !!(f.toUni && f.toUni.has(c));
+    if (f.toUni && f.toUni.size && f.subset) return f.toUni.has(c);
+    if (!f.embedded || !f.subset) return true;
+    if (f.widths) {
+      const w = f.widths[c - f.firstChar];
+      return w !== undefined && w > 0;
+    }
+    return true;
+  }
+
+  function reverseMap(f) {
+    if (f.rev) return f.rev;
+    const rev = new Map();
+    if (f.toUni) {
+      for (const [code, str] of f.toUni) {
+        if (str && !rev.has(str) && (!f.type0 || code <= 0xFFFF)) rev.set(str, code);
+      }
+    }
+    if (!f.type0) {
+      for (let c = 32; c < 256; c++) {
+        const str = codeText(f, c);
+        if (str && !rev.has(str) && codeAvailable(f, c)) rev.set(str, c);
+      }
+    }
+    f.rev = rev;
+    return rev;
+  }
+
+  function pdfName(n) {
+    let out = '/';
+    for (const ch of n) {
+      const c = ch.charCodeAt(0);
+      out += c < 33 || c > 126 || '()<>[]{}/%#'.includes(ch) ? '#' + c.toString(16).padStart(2, '0') : ch;
+    }
+    return out;
   }
 
   /* ------------------------------------------------------------------ *
@@ -536,7 +612,11 @@
   }
 
   class Scanner {
-    constructor(lib, pdfDoc) {
+    constructor(lib, pdfDoc, std) {
+      this.std = std || null;
+      this.byId = new Map();
+      this.fallbackFonts = {};
+      this.editInfo = new Map();
       this.doc = pdfDoc;
       this.ctx = pdfDoc.context;
       this.streams = new Map(); // key -> {ops, bytes, kind, ref, pageIndex}
@@ -553,7 +633,7 @@
       const dict = deref(this.ctx, raw);
       let f = null;
       if (dict instanceof lib().PDFDict) {
-        try { f = loadFont(this.ctx, dict); } catch (e) { f = null; }
+        try { f = loadFont(this.ctx, dict, this.std); } catch (e) { f = null; }
       }
       if (!f) {
         f = { type0: false, baseFont: name, style: fontStyle(name), hasWidths: false, widths: null, firstChar: 0,
@@ -596,6 +676,7 @@
         origContents: node.get(N('Contents'))
       });
       const resources = node.Resources ? node.Resources() : get(this.ctx, node, 'Resources');
+      this.streams.get(key).resources = resources;
       this.interpret(key, ops, resources, ID, elements, 0, new Set(), { wm: false, alpha: 1 });
 
       // Anmerkungen (Stempel, Formularfelder, Freitext …)
@@ -608,19 +689,58 @@
           const rect = arr(this.ctx, get(this.ctx, a, 'Rect'));
           if (!rect || rect.length < 4) return;
           const r = rect.map(v => num(v, 0));
-          elements.push({
-            kind: 'annot',
-            sub,
-            keys: ['a' + pageIndex + ':' + i],
-            bbox: [Math.min(r[0], r[2]), Math.min(r[1], r[3]), Math.max(r[0], r[2]), Math.max(r[1], r[3])],
-            wm: sub === 'Watermark' || sub === 'Stamp'
-          });
+          if (num(get(this.ctx, a, 'F'), 0) & 2) return; // versteckt
+          const bbox = [Math.min(r[0], r[2]), Math.min(r[1], r[3]), Math.max(r[0], r[2]), Math.max(r[1], r[3])];
+          const wm = sub === 'Watermark' || sub === 'Stamp';
+          elements.push({ kind: 'annot', sub, keys: ['a' + pageIndex + ':' + i], bbox, wm });
+          // Inhalt des Erscheinungsbilds (Formularfeld-Werte, Stempeltexte …) einzeln erkennen
+          try { this.scanAppearance(a, bbox, elements, wm); } catch (e) { console.warn('Anmerkung', e); }
         });
       }
       this.streams.get(key).origAnnots = node.get(N('Annots'));
 
       elements.forEach((el, i) => { el.id = pageIndex + ':' + i; el.page = pageIndex; });
-      return { index: pageIndex, elements: this.groupText(elements) };
+      const grouped = this.groupText(elements);
+      for (const el of grouped) this.byId.set(el.id, el);
+      return { index: pageIndex, elements: grouped };
+    }
+
+    scanAppearance(annot, rect, elements, wm) {
+      const L = lib();
+      const ctx = this.ctx;
+      const ap = get(ctx, annot, 'AP');
+      if (!(ap instanceof L.PDFDict)) return;
+      let raw = ap.get(N('N'));
+      let n = deref(ctx, raw);
+      if (n instanceof L.PDFDict && !(n instanceof L.PDFStream)) {
+        const as = nameOf(get(ctx, annot, 'AS'));
+        if (!as) return;
+        raw = n.get(N(as));
+        n = deref(ctx, raw);
+      }
+      if (!(n instanceof L.PDFStream) || !(raw instanceof L.PDFRef)) return;
+      const fkey = raw.toString();
+      let entry = this.streams.get(fkey);
+      if (!entry) {
+        let fb = new Uint8Array(0);
+        try { fb = streamBytes(n); } catch (e) { /* ignorieren */ }
+        entry = { ops: parseOps(fb), bytes: fb, kind: 'form', ref: raw, orig: n, annot };
+        this.streams.set(fkey, entry);
+      }
+      const bb = (arr(ctx, get(ctx, n.dict, 'BBox')) || []).map(v => num(v, 0));
+      if (bb.length < 4) return;
+      const m = arr(ctx, get(ctx, n.dict, 'Matrix'));
+      const fm = m && m.length === 6 ? m.map(v => num(v, 0)) : ID;
+      const tb = bboxOf([apply(fm, bb[0], bb[1]), apply(fm, bb[2], bb[1]), apply(fm, bb[0], bb[3]), apply(fm, bb[2], bb[3])]);
+      const sx = (rect[2] - rect[0]) / ((tb[2] - tb[0]) || 1);
+      const sy = (rect[3] - rect[1]) / ((tb[3] - tb[1]) || 1);
+      const A = [sx, 0, 0, sy, rect[0] - tb[0] * sx, rect[1] - tb[1] * sy];
+      const res = get(ctx, n.dict, 'Resources');
+      entry.resources = res;
+      const sub = [];
+      this.interpret(fkey, entry.ops, res, mul(fm, A), sub, 1, new Set([fkey]), { wm, alpha: 1 });
+      for (const e of sub) e.inAnnot = true;
+      elements.push(...sub);
     }
 
     // Aufeinanderfolgende Textstücke derselben Zeile zu einem Element zusammenfassen
@@ -629,7 +749,11 @@
       let cur = null;
       for (const el of elements) {
         if (el.kind !== 'text') { cur = null; out.push(el); continue; }
-        if (cur && cur.stream === el.stream && Math.abs(cur.angle - el.angle) < 0.02 &&
+        // Ersatzschrift-Stücke (PEd…) aus früheren Bearbeitungen gehören zur Zeile dazu
+        const isFb = e => /^PEd/.test(e.ops[0].fontName || '');
+        if (cur && cur.stream === el.stream && (cur.font === el.font || isFb(cur) || isFb(el) || cur.hasFb) &&
+          cur.invisible === el.invisible &&
+          Math.abs(cur.angle - el.angle) < 0.02 &&
           Math.abs(cur.size - el.size) < 0.25 * Math.max(cur.size, 1)) {
           // Abstand in Leserichtung bestimmen
           const cos = Math.cos(el.angle), sin = Math.sin(el.angle);
@@ -639,7 +763,13 @@
           if (Math.abs(across) < 0.3 * el.size && along > -0.5 * el.size && along < 0.15 * el.size) {
             if (along > 0.18 * el.size && !/\s$/.test(cur.text) && !/^\s/.test(el.text)) cur.text += ' ';
             cur.text += el.text;
+            if (isFb(el) || isFb(cur)) cur.hasFb = true;
+            if (isFb(cur) && !isFb(el) && cur.ops.every(o => /^PEd/.test(o.fontName || ''))) {
+              cur.font = el.font;
+              cur.style = el.style;
+            }
             cur.keys.push(...el.keys);
+            cur.ops.push(...el.ops);
             cur.bbox = [Math.min(cur.bbox[0], el.bbox[0]), Math.min(cur.bbox[1], el.bbox[1]),
               Math.max(cur.bbox[2], el.bbox[2]), Math.max(cur.bbox[3], el.bbox[3])];
             cur.end = el.end;
@@ -716,8 +846,8 @@
         }
         this.replacements.set(key, repl);
 
-        // unsichtbarer Text (z. B. OCR-Ebene), reine Abstände oder nur Leerzeichen
-        if (gs.Tr === 3 || gs.Tr === 7 || !glyphs || !text.trim()) return;
+        // reine Abstände oder nur Leerzeichen
+        if (!glyphs || !text.trim()) return;
         const deg = Math.abs(((angle * 180 / Math.PI) % 90 + 90) % 90);
         const lum = 0.299 * gs.fill[0] + 0.587 * gs.fill[1] + 0.114 * gs.fill[2];
         elements.push({
@@ -731,7 +861,11 @@
           origin,
           end,
           color: gs.fill.slice(),
-          style: font.style,
+          style: Object.assign({}, font.style),
+          font,
+          // unsichtbarer Text = Texterkennungs-Ebene über einem Scan
+          invisible: gs.Tr === 3 || gs.Tr === 7,
+          ops: [{ key, op, font, fontName: gs.fontName, Tfs: gs.Tfs, Th: gs.Th, Tc: gs.Tc, Tw: gs.Tw, adv, resources }],
           wm: inWM() || gs.alpha < 0.95 || (deg > 5 && deg < 85) || (size >= 36 && lum > 0.55)
         });
       };
@@ -788,7 +922,8 @@
           case 'Tr': gs.Tr = +a[0] || 0; break;
           case 'Ts': gs.Ts = +a[0] || 0; break;
           case 'Tf':
-            gs.font = this.fontFor(resources, a[0] && a[0].n);
+            gs.fontName = a[0] && a[0].n;
+            gs.font = this.fontFor(resources, gs.fontName);
             gs.Tfs = +a[1] || 0;
             break;
           case 'Td': Tlm = mul([1, 0, 0, 1, +a[0] || 0, +a[1] || 0], Tlm); Tm = Tlm; break;
@@ -843,13 +978,15 @@
                 { wm: inWM(), alpha: gs.alpha });
               formStack.delete(fkey);
               // Formular-Objekte, die selbst wie Wasserzeichen aussehen, als Ganzes markierbar machen
+              entry.resources = fres;
               const allWm = sub2.length > 0 && sub2.every(e => e.wm);
               if (allWm) {
+                // Wasserzeichen-Gruppe als Ganzes löschbar, Einzelteile bleiben anklickbar
                 const bb = bboxOf(sub2.flatMap(e => [[e.bbox[0], e.bbox[1]], [e.bbox[2], e.bbox[3]]]));
                 elements.push({ kind: 'form', stream: streamKey, keys: [key], bbox: bb, wm: true });
-              } else {
-                elements.push(...sub2);
+                for (const e of sub2) e.wmGroup = true;
               }
+              elements.push(...sub2);
             }
             break;
           }
@@ -884,12 +1021,14 @@
     }
 
     // Content-Stream ohne gelöschte Operatoren erzeugen
-    rebuildStream(key, deleted) {
+    rebuildStream(key, deleted, overrides) {
       const entry = this.streams.get(key);
       const parts = [];
       for (let i = 0; i < entry.ops.length; i++) {
         const k = key + ':' + i;
-        if (deleted.has(k)) {
+        if (overrides && overrides.has(k)) {
+          parts.push(toBytes(overrides.get(k) + '\n'));
+        } else if (deleted.has(k)) {
           const r = this.replacements.get(k);
           if (r) parts.push(toBytes(r + '\n'));
         } else {
@@ -901,10 +1040,132 @@
     }
 
     // Löschungen auf das pdf-lib-Dokument anwenden (immer ausgehend vom Original)
-    applyDeletions(deletedKeys) {
+    // Ersatzschrift (Standardschrift) im Ressourcen-Verzeichnis eines Streams anmelden
+    fallbackFontName(resources, style) {
+      const L = lib();
+      const std = stdFontName(style);
+      if (!this.fallbackFonts[std]) this.fallbackFonts[std] = this.doc.embedStandardFont(std);
+      const font = this.fallbackFonts[std];
+      const name = 'PEd' + std.replace(/[^A-Za-z]/g, '');
+      if (resources instanceof L.PDFDict) {
+        let fonts = deref(this.ctx, resources.get(N('Font')));
+        if (!(fonts instanceof L.PDFDict)) {
+          fonts = this.ctx.obj({});
+          resources.set(N('Font'), fonts);
+        }
+        if (!fonts.has(N(name))) fonts.set(N(name), font.ref);
+      }
+      return { font, name };
+    }
+
+    // Neuen Text in der Originalschrift kodieren. Fehlende Zeichen kommen aus einer Ersatzschrift.
+    encodeEdit(el, text) {
+      const first = el.ops[0];
+      // Schrift: die erste "echte" Originalschrift der Zeile (nicht eine frühere Ersatzschrift)
+      const prim = el.ops.find(op => !/^PEd/.test(op.fontName || '')) || first;
+      const o = Object.assign({}, prim, { adv: first.adv, op: first.op, Tfs: first.Tfs, Th: first.Th, Tc: first.Tc, Tw: first.Tw });
+      const f = o.font;
+      const rev = reverseMap(f);
+      const missing = [];
+      const segs = []; // {orig:true, items:[]} | {fb:true, str}
+      let adv = 0;
+      const hex = code => f.type0 ? code.toString(16).padStart(4, '0') : code.toString(16).padStart(2, '0');
+      const origSeg = () => {
+        let s = segs[segs.length - 1];
+        if (!s || !s.orig) { s = { orig: true, items: [] }; segs.push(s); }
+        return s;
+      };
+      for (const ch of text.replace(/[\r\n]+/g, ' ')) {
+        if (rev.has(ch)) {
+          const code = rev.get(ch);
+          const s = origSeg();
+          const last = s.items[s.items.length - 1];
+          if (typeof last === 'string') s.items[s.items.length - 1] = last + hex(code);
+          else s.items.push(hex(code));
+          const w = codeWidth(f, code) * f.scale;
+          adv += (w * o.Tfs + o.Tc + (!f.type0 && code === 32 ? o.Tw : 0)) * o.Th;
+        } else if (ch === ' ' || ch === '\u00A0') {
+          // Leerzeichen fehlt in der Schrift: als Abstand setzen
+          origSeg().items.push(-250);
+          adv += (0.25 * o.Tfs + o.Tc + o.Tw) * o.Th;
+        } else {
+          missing.push(ch);
+          let s = segs[segs.length - 1];
+          if (!s || !s.fb) { s = { fb: true, str: '' }; segs.push(s); }
+          s.str += ch;
+        }
+      }
+      let out = '';
+      let fbInfo = null;
+      for (const s of segs) {
+        if (s.orig) {
+          out += '[' + s.items.map(it => typeof it === 'number' ? fmt(it) : '<' + it + '>').join(' ') + '] TJ ';
+        } else {
+          if (!fbInfo) fbInfo = this.fallbackFontName(o.resources, el.style);
+          const fbf = fbInfo.font;
+          let str = '';
+          for (const ch of s.str) {
+            try { fbf.encodeText(ch); str += ch; } catch (e) { str += '?'; }
+          }
+          const w = fbf.widthOfTextAtSize(str, o.Tfs);
+          const spaces = (str.match(/ /g) || []).length;
+          adv += (w + o.Tc * [...str].length + o.Tw * spaces) * o.Th;
+          out += pdfName(fbInfo.name) + ' ' + fmt(o.Tfs) + ' Tf ' + fbf.encodeText(str).toString() + ' Tj ' +
+            pdfName(o.fontName || '') + ' ' + fmt(o.Tfs) + ' Tf ';
+        }
+      }
+      // Vorschub wie beim Original, damit nachfolgender Text nicht verrutscht
+      if (o.Tfs && o.Th) out += '[' + fmt(-(o.adv - adv) / (o.Tfs * o.Th) * 1000) + '] TJ';
+      if (prim !== first) {
+        out = pdfName(prim.fontName) + ' ' + fmt(o.Tfs) + ' Tf ' + out + ' ' + pdfName(first.fontName || '') + ' ' + fmt(o.Tfs) + ' Tf';
+      }
+      if (o.op === "'") out = 'T* ' + out;
+      if (o.op === '"') out = fmt(o.Tw) + ' Tw ' + fmt(o.Tc) + ' Tc T* ' + out;
+      this.editInfo.set(el.id, { missing, fallback: fbInfo ? stdFontName(el.style) : null, adv });
+      return out;
+    }
+
+    // Formularfeld-Wert (/V) mitziehen, damit andere Programme den neuen Text anzeigen
+    setFieldValue(annot, text) {
+      const L = lib();
+      let field = annot;
+      for (let i = 0; i < 10 && field; i++) {
+        if (field.has(N('V')) || field.has(N('T'))) break;
+        field = deref(this.ctx, field.get(N('Parent')));
+      }
+      if (!(field instanceof L.PDFDict)) return;
+      if (!this.origValues) this.origValues = new Map();
+      if (!this.origValues.has(field)) this.origValues.set(field, field.get(N('V')));
+      if (text === null) {
+        const v = this.origValues.get(field);
+        if (v) field.set(N('V'), v); else field.delete(N('V'));
+      } else {
+        field.set(N('V'), L.PDFHexString.fromText(text));
+      }
+    }
+
+    applyDeletions(deletedKeys, edits) {
       const deleted = deletedKeys instanceof Set ? deletedKeys : new Set(deletedKeys);
       const byStream = new Map();
       const annotDel = new Map();
+      // Textänderungen: erster Operator bekommt den neuen Text, die übrigen werden geleert
+      const overrides = new Map();
+      const editedAnnots = new Map();
+      this.editInfo.clear();
+      if (edits) {
+        for (const [id, text] of (edits instanceof Map ? edits : Object.entries(edits))) {
+          const el = this.byId.get(id);
+          if (!el || el.kind !== 'text' || el.keys.every(k => deleted.has(k))) continue;
+          el.ops.forEach((o, i) => {
+            overrides.set(o.key, i === 0 ? this.encodeEdit(el, text) : (this.replacements.get(o.key) || ''));
+          });
+          byStream.set(el.stream, true);
+          const entry = this.streams.get(el.stream);
+          if (entry && entry.annot) editedAnnots.set(entry.annot, text);
+        }
+      }
+      if (this.origValues) for (const field of this.origValues.keys()) this.setFieldValue(field, null);
+      for (const [annot, text] of editedAnnots) this.setFieldValue(annot, text);
       for (const k of deleted) {
         if (k[0] === 'a') {
           const [p, i] = k.slice(1).split(':').map(Number);
@@ -921,7 +1182,7 @@
         if (entry.kind === 'page') {
           const node = pages[entry.pageIndex].node;
           if (touched) {
-            const s = this.ctx.flateStream(this.rebuildStream(key, deleted));
+            const s = this.ctx.flateStream(this.rebuildStream(key, deleted, overrides));
             node.set(N('Contents'), this.ctx.register(s));
           } else if (entry.origContents) {
             node.set(N('Contents'), entry.origContents);
@@ -946,7 +1207,7 @@
               if (n === 'Filter' || n === 'DecodeParms' || n === 'Length') continue;
               dict[n] = v;
             }
-            this.ctx.assign(entry.ref, this.ctx.flateStream(this.rebuildStream(key, deleted), dict));
+            this.ctx.assign(entry.ref, this.ctx.flateStream(this.rebuildStream(key, deleted, overrides), dict));
           } else {
             this.ctx.assign(entry.ref, entry.orig);
           }
@@ -963,7 +1224,7 @@
       err.code = 'ENCRYPTED';
       throw err;
     }
-    const scanner = new Scanner(L, doc);
+    const scanner = new Scanner(L, doc, await standardFonts());
     scanner.scanAll();
     return scanner;
   }

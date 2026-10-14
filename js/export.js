@@ -70,9 +70,9 @@
   async function baseBytes(doc, extraDeleted) {
     const del = new Set(doc.deleted);
     if (extraDeleted) for (const k of extraDeleted) del.add(k);
-    doc.scanner.applyDeletions(del);
+    doc.scanner.applyDeletions(del, doc.edits);
     const bytes = await doc.scanner.doc.save({ useObjectStreams: false });
-    if (extraDeleted) doc.scanner.applyDeletions(doc.deleted);
+    if (extraDeleted) doc.scanner.applyDeletions(doc.deleted, doc.edits);
     return bytes;
   }
 
@@ -81,6 +81,7 @@
     const L = PDFLib;
     const bytes = await baseBytes(doc, opts.extraDeleted);
     if (!doc.overlays.length) return bytes;
+    const toRgb = hex => { const [r, g, b] = hexToRgb(hex); return L.rgb(r, g, b); };
     const out = await L.PDFDocument.load(bytes, { updateMetadata: false });
     const pages = out.getPages();
     const fonts = {};
@@ -108,6 +109,9 @@
             x: p[0], y: p[1], size: ov.size, font, color: L.rgb(r, g, b), rotate: L.degrees(deg)
           });
         });
+      } else if (ov.type === 'rect') {
+        const { p, deg } = angleAt(ov.x, ov.y + ov.h);
+        page.drawRectangle({ x: p[0], y: p[1], width: ov.w, height: ov.h, color: toRgb(ov.color), rotate: L.degrees(deg) });
       } else if (ov.type === 'image') {
         const src = doc.images[ov.img];
         if (!src) continue;
@@ -165,11 +169,12 @@
     const texts = doc.pages.map(() => []);
     doc.pages.forEach((p, pi) => {
       for (const el of p.elements) {
-        if (el.kind !== 'text' || el.keys.every(k => doc.deleted.has(k))) continue;
+        if (el.kind !== 'text' || el.invisible || el.ocr || el.keys.every(k => doc.deleted.has(k))) continue;
         if (Math.abs(el.vang) > 0.03) continue;
         extra.push(...el.keys);
         texts[pi].push({
-          x: el.r[0], y: el.r[1], w: el.r[2], text: el.text, size: el.size,
+          x: el.r[0], y: el.r[1], w: el.r[2], text: doc.edits[el.id] !== undefined ? doc.edits[el.id] : el.text,
+          size: el.size,
           font: el.style.name || WORD_FONT[el.style.family], bold: el.style.bold, italic: el.style.italic,
           color: el.color
         });
@@ -248,6 +253,9 @@
       name: doc.name,
       pdf: toBase64(doc.bytes),
       deleted: [...doc.deleted],
+      edits: doc.edits,
+      covered: [...doc.covered],
+      ocr: doc.ocr,
       overlays: doc.overlays,
       images: doc.images
     };

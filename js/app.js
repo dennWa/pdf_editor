@@ -99,6 +99,9 @@
         scanner,
         pages: scanner.pages.map(p => ({ elements: p.elements })),
         deleted: new Set(restore ? restore.deleted : []),
+        edits: restore && restore.edits ? restore.edits : {}, // Element-ID -> neuer Text (Originalschrift)
+        covered: new Set(restore && restore.covered ? restore.covered : []), // übermalte Scan-Texte
+        ocr: restore && restore.ocr ? restore.ocr : {},
         overlays: restore ? restore.overlays : [],
         images: restore ? restore.images || {} : {},
         undo: [],
@@ -110,11 +113,16 @@
         pdfjs: null
       };
       state.docs.push(d);
+      for (const [pi, list] of Object.entries(d.ocr)) {
+        if (d.pages[pi]) d.pages[pi].elements.push(...list.map(ocrElement));
+      }
       buildDocView(d);
       await render(d);
       activate(d);
       const counts = d.pages.reduce((n, p) => n + p.elements.length, 0);
-      toast(d.pages.length + (d.pages.length === 1 ? ' Seite' : ' Seiten') + ', ' + counts + ' Elemente erkannt.');
+      const msg = d.pages.length + (d.pages.length === 1 ? ' Seite' : ' Seiten') + ', ' + counts + ' Elemente erkannt.';
+      const scan = scanHint(d);
+      toast(scan ? msg + ' ' + scan : msg, scan ? 9000 : 3500);
     } catch (e) {
       console.error(e);
       if (e.code === 'ENCRYPTED') {
@@ -125,6 +133,28 @@
     } finally {
       busy(null);
     }
+  }
+
+  // Gespeicherte Texterkennungs-Ergebnisse wieder zu Elementen machen
+  function ocrElement(o) {
+    return {
+      id: o.id, page: o.page, kind: 'text', ocr: true, keys: [], r: o.r.slice(), text: o.text, size: o.size,
+      style: { family: 'sans', bold: false, italic: false, name: null }, color: [0, 0, 0], wm: false, vang: 0
+    };
+  }
+
+  function scanHint(d) {
+    let invisible = false, scanned = false;
+    for (const p of d.pages) {
+      const W = p.vp1.width, H = p.vp1.height;
+      const big = p.elements.some(e => e.kind === 'image' && e.r[2] * e.r[3] > 0.5 * W * H);
+      const vis = p.elements.filter(e => e.kind === 'text' && !e.invisible && !e.ocr).length;
+      if (p.elements.some(e => e.invisible)) invisible = true;
+      else if (big && vis < 3 && !p.elements.some(e => e.ocr)) scanned = true;
+    }
+    if (invisible) return 'Scan mit Textebene erkannt: Doppelklick auf einen Text übermalt das Alte passend und setzt neuen Text darüber.';
+    if (scanned) return 'Diese PDF sieht nach einem Scan aus – klick auf „Text erkennen“, dann wird die Schrift einzeln anklickbar.';
+    return '';
   }
 
   function closeDoc(d) {
@@ -197,8 +227,8 @@
   }
 
   async function currentBytes(d) {
-    if (!d.deleted.size) return d.bytes;
-    d.scanner.applyDeletions(d.deleted);
+    if (!d.deleted.size && !Object.keys(d.edits).length) return d.bytes;
+    d.scanner.applyDeletions(d.deleted, d.edits);
     return d.scanner.doc.save({ useObjectStreams: false });
   }
 
@@ -220,6 +250,7 @@
       if (token !== d.renderToken) break;
     }
     if (old) old.destroy();
+    updateEditedBoxes(d);
     refreshElementState(d);
     renderOverlays(d);
   }
@@ -265,6 +296,7 @@
   function layoutElements(d, p) {
     p.elDivs = new Map();
     for (const e of p.elements) {
+      if (e.ocr) { addElementDiv(p, e); continue; }
       const r = p.vp1.convertToViewportRectangle(e.bbox);
       const x = Math.min(r[0], r[2]), y = Math.min(r[1], r[3]);
       e.r = [x, y, Math.abs(r[2] - r[0]), Math.abs(r[3] - r[1])];
@@ -274,16 +306,41 @@
         e.vorigin = o;
         e.vang = Math.atan2(t[1] - o[1], t[0] - o[0]);
       }
-      const div = el('div', 'el ' + e.kind + (e.wm ? ' wm' : ''), p.elLayer);
-      div.style.left = (x - 1) + 'px';
-      div.style.top = (y - 1) + 'px';
-      div.style.width = Math.max(e.r[2], 2) + 2 + 'px';
-      div.style.height = Math.max(e.r[3], 2) + 2 + 'px';
-      p.elDivs.set(e.id, div);
+      addElementDiv(p, e);
     }
   }
 
-  const isDeleted = (d, e) => e.keys.every(k => d.deleted.has(k));
+  function addElementDiv(p, e) {
+    const div = el('div', 'el ' + e.kind + (e.wm ? ' wm' : '') + (e.invisible || e.ocr ? ' scan' : ''), p.elLayer);
+    e.r0 = e.r0 || e.r.slice();
+    placeElementDiv(div, e.r);
+    p.elDivs.set(e.id, div);
+  }
+
+  function placeElementDiv(div, r) {
+    div.style.left = (r[0] - 1) + 'px';
+    div.style.top = (r[1] - 1) + 'px';
+    div.style.width = Math.max(r[2], 2) + 2 + 'px';
+    div.style.height = Math.max(r[3], 2) + 2 + 'px';
+  }
+
+  // Nach einer Textänderung die Rahmenbreite an den neuen Text anpassen
+  function updateEditedBoxes(d) {
+    for (const p of d.pages) {
+      if (!p.elDivs) continue;
+      for (const e of p.elements) {
+        if (e.kind !== 'text' || !e.ops) continue;
+        const info = d.edits[e.id] !== undefined && d.scanner.editInfo.get(e.id);
+        const orig = e.ops.reduce((n, o) => n + o.adv, 0);
+        e.r = e.r0.slice();
+        if (info && orig > 0 && Math.abs(e.vang || 0) < 0.03) e.r[2] = e.r0[2] * info.adv / orig;
+        placeElementDiv(p.elDivs.get(e.id), e.r);
+      }
+    }
+  }
+
+  const curText = (d, e) => d.edits[e.id] !== undefined ? d.edits[e.id] : e.text.trim();
+  const isDeleted = (d, e) => d.covered.has(e.id) || (e.keys.length > 0 && e.keys.every(k => d.deleted.has(k)));
 
   function refreshElementState(d) {
     for (const p of d.pages) {
@@ -311,6 +368,10 @@
       if (ov.type === 'text') {
         styleText(div, ov);
         div.textContent = ov.text;
+      } else if (ov.type === 'rect') {
+        div.style.width = ov.w + 'px';
+        div.style.height = ov.h + 'px';
+        div.style.background = ov.color;
       } else {
         div.style.width = ov.w + 'px';
         div.style.height = ov.h + 'px';
@@ -341,7 +402,12 @@
    *  Rückgängig / Wiederholen
    * ------------------------------------------------------------------ */
   function snapshot(d) {
-    return { deleted: [...d.deleted], overlays: clone(d.overlays.filter(o => o.type !== 'text' || o.text.trim())) };
+    return {
+      deleted: [...d.deleted],
+      overlays: clone(d.overlays.filter(o => o.type !== 'text' || o.text.trim())),
+      edits: Object.assign({}, d.edits),
+      covered: [...d.covered]
+    };
   }
 
   function pushUndo(d) {
@@ -353,9 +419,12 @@
   }
 
   async function restore(d, snap) {
-    const delChanged = snap.deleted.length !== d.deleted.size || snap.deleted.some(k => !d.deleted.has(k));
+    const delChanged = snap.deleted.length !== d.deleted.size || snap.deleted.some(k => !d.deleted.has(k)) ||
+      JSON.stringify(snap.edits) !== JSON.stringify(d.edits);
     d.deleted = new Set(snap.deleted);
     d.overlays = snap.overlays;
+    d.edits = snap.edits;
+    d.covered = new Set(snap.covered);
     d.sel.clear();
     markDirty(d);
     updateButtons();
@@ -426,44 +495,161 @@
     const els = selectedElements(d);
     const ovs = selectedOverlays(d);
     pushUndo(d);
-    for (const e of els) e.keys.forEach(k => d.deleted.add(k));
+    for (const e of els) {
+      if (e.invisible || e.ocr) coverElement(d, e);
+      else e.keys.forEach(k => d.deleted.add(k));
+    }
     d.overlays = d.overlays.filter(o => !ovs.includes(o));
     d.sel.clear();
     updateCtx();
-    if (els.length) {
+    if (els.some(e => e.keys.length && !e.invisible)) {
       busy('Entferne …');
       try { await render(d); } finally { busy(null); }
     } else {
+      refreshElementState(d);
       renderOverlays(d);
     }
   }
 
-  // Originaltext in bearbeitbaren Text umwandeln
-  async function editOriginalText(d, e) {
+  // Farben unter einem Bereich aus dem gerenderten Bild ablesen (Hintergrund + Schrift)
+  function sampleColors(p, r) {
+    const c = p.canvas;
+    const k = c.width / p.vp1.width;
+    const pad = 3;
+    const x0 = Math.max(0, Math.floor((r[0] - pad) * k)), y0 = Math.max(0, Math.floor((r[1] - pad) * k));
+    const x1 = Math.min(c.width, Math.ceil((r[0] + r[2] + pad) * k)), y1 = Math.min(c.height, Math.ceil((r[1] + r[3] + pad) * k));
+    const w = x1 - x0, h = y1 - y0;
+    if (w < 2 || h < 2) return { bg: '#ffffff', fg: '#000000' };
+    const px = c.getContext('2d').getImageData(x0, y0, w, h).data;
+    const border = [], inner = [];
+    const bw = Math.max(1, Math.round(pad * k * 0.6));
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const v = [px[i], px[i + 1], px[i + 2]];
+        if (x < bw || y < bw || x >= w - bw || y >= h - bw) border.push(v);
+        else inner.push(v);
+      }
+    }
+    const median = list => [0, 1, 2].map(ch => {
+      const vals = list.map(v => v[ch]).sort((a, b) => a - b);
+      return vals[vals.length >> 1] || 0;
+    });
+    const hex = v => '#' + v.map(n => Math.round(n).toString(16).padStart(2, '0')).join('');
+    const bg = median(border.length ? border : inner);
+    const lum = v => 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2];
+    inner.sort((a, b) => lum(a) - lum(b));
+    const dark = inner.slice(0, Math.max(1, Math.round(inner.length * 0.08)));
+    const fg = dark.length ? median(dark) : [0, 0, 0];
+    return { bg: hex(bg), fg: Math.abs(lum(fg) - lum(bg)) < 40 ? '#000000' : hex(fg) };
+  }
+
+  // Scan-Text (Bild) mit Hintergrundfarbe übermalen
+  function coverElement(d, e) {
+    const p = d.pages[e.page];
+    const r = e.r;
+    const padY = r[3] * 0.12, padX = Math.min(3, r[3] * 0.15);
+    const { bg, fg } = sampleColors(p, [r[0] - padX, r[1] - padY, r[2] + 2 * padX, r[3] + 2 * padY]);
+    d.overlays.push({
+      id: nextOvId(d), page: e.page, type: 'rect', color: bg,
+      x: r[0] - padX, y: r[1] - padY, w: r[2] + 2 * padX, h: r[3] + 2 * padY
+    });
+    if (e.keys.length) e.keys.forEach(k => d.deleted.add(k));
+    d.covered.add(e.id);
+    return fg;
+  }
+
+  function editOriginalText(d, e) {
+    if (e.invisible || e.ocr) return replaceScanText(d, e);
+    openInlineEditor(d, e);
+  }
+
+  // Scan: alten Text übermalen und neuen Text in passender Farbe/Größe darüberlegen
+  function replaceScanText(d, e) {
     pushUndo(d);
-    e.keys.forEach(k => d.deleted.add(k));
-    const fam = e.style.family;
+    const fg = coverElement(d, e);
+    const fam = e.style.family || 'sans';
     const size = Math.round(e.size * 10) / 10;
-    const base = e.vorigin || [e.r[0], e.r[1] + e.r[3] * 0.8];
     const ov = {
-      id: nextOvId(d),
-      page: e.page,
-      type: 'text',
-      x: base[0],
-      y: base[1] - E.BASELINE[fam] * size,
-      text: e.text.trim(),
-      size,
-      family: fam,
-      bold: !!e.style.bold,
-      italic: !!e.style.italic,
-      color: rgbToHex(e.color)
+      id: nextOvId(d), page: e.page, type: 'text',
+      x: e.r[0], y: e.r[1] + e.r[3] / 2 - size * E.LINE_HEIGHT / 2,
+      text: e.text.trim(), size, family: fam, bold: !!e.style.bold, italic: !!e.style.italic, color: fg
     };
     d.overlays.push(ov);
     d.sel.clear();
     d.sel.add('o' + ov.id);
-    await render(d);
+    // unsichtbarer Text ändert das Bild nicht – kein Neuzeichnen nötig
+    refreshElementState(d);
+    renderOverlays(d);
     updateCtx();
     startEditing(d, ov, true);
+  }
+
+  // Originaltext direkt an Ort und Stelle bearbeiten – gespeichert wird in der Originalschrift
+  let inline = null;
+  function openInlineEditor(d, e) {
+    commitEditing();
+    closeInline(true);
+    const p = d.pages[e.page];
+    const fam = e.style.family || 'sans';
+    const size = e.size;
+    const o = e.vorigin || [e.r[0], e.r[1] + e.r[3] * 0.8];
+    const box = el('div', 'inline-edit', p.scaled);
+    box.style.left = o[0] + 'px';
+    box.style.top = (o[1] - E.BASELINE[fam] * size) + 'px';
+    box.style.minWidth = e.r[2] + 'px';
+    box.style.fontSize = size + 'px';
+    box.style.fontFamily = (e.style.name ? '"' + e.style.name.replace(/"/g, '') + '", ' : '') + E.FONT_CSS[fam];
+    box.style.fontWeight = e.style.bold ? '700' : '400';
+    box.style.fontStyle = e.style.italic ? 'italic' : 'normal';
+    box.style.color = rgbToHex(e.color);
+    if (Math.abs(e.vang || 0) > 0.03) {
+      box.style.transformOrigin = '0 ' + (E.BASELINE[fam] * size) + 'px';
+      box.style.transform = 'rotate(' + e.vang + 'rad)';
+    }
+    box.textContent = curText(d, e);
+    try { box.contentEditable = 'plaintext-only'; } catch (err) { box.contentEditable = 'true'; }
+    if (box.contentEditable !== 'plaintext-only') box.contentEditable = 'true';
+    inline = { d, e, box };
+    box.focus();
+    const range = document.createRange();
+    range.selectNodeContents(box);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    box.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); closeInline(); }
+      if (ev.key === 'Escape') { ev.preventDefault(); closeInline(true); }
+      ev.stopPropagation();
+    });
+    box.addEventListener('blur', () => closeInline());
+  }
+
+  async function closeInline(cancel) {
+    if (!inline) return;
+    const { d, e, box } = inline;
+    inline = null;
+    const text = box.innerText.replace(/[\r\n]+/g, ' ');
+    box.remove();
+    if (cancel || text === curText(d, e)) return;
+    pushUndo(d);
+    if (!text.trim()) {
+      e.keys.forEach(k => d.deleted.add(k));
+      delete d.edits[e.id];
+    } else if (text === e.text.trim()) {
+      delete d.edits[e.id];
+    } else {
+      d.edits[e.id] = text;
+    }
+    busy('Übernehme Änderung …');
+    try { await render(d); } finally { busy(null); }
+    updateCtx();
+    const info = d.scanner.editInfo.get(e.id);
+    if (info && info.missing.length) {
+      const chars = [...new Set(info.missing)].join(' ');
+      toast('Hinweis: „' + chars + '“ ist in der Originalschrift dieser PDF nicht enthalten – ' +
+        'dafür wird die ähnlichste Standardschrift (' + info.fallback + ') verwendet.', 7000);
+    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -526,6 +712,7 @@
     p.wrap.addEventListener('pointerdown', ev => {
       if (ev.button !== 0) return;
       if (editing && editing.div.contains(ev.target)) return;
+      if (inline && inline.box.contains(ev.target)) return;
       commitEditing();
       const [x, y] = pagePoint(p, ev);
       const ovEl = ev.target.closest('.ov');
@@ -566,7 +753,7 @@
         return;
       }
 
-      drag = { type: 'band', start: [x, y], band: null, shift: ev.shiftKey };
+      drag = { type: state.tool === 'cover' ? 'cover' : 'band', start: [x, y], band: null, shift: ev.shiftKey };
       p.wrap.setPointerCapture(ev.pointerId);
     });
 
@@ -587,9 +774,9 @@
         return;
       }
       const dx = x - drag.start[0], dy = y - drag.start[1];
-      if (drag.type === 'band') {
+      if (drag.type === 'band' || drag.type === 'cover') {
         if (!drag.band && Math.hypot(dx, dy) * zoom() < 4) return;
-        if (!drag.band) drag.band = el('div', 'band', p.scaled);
+        if (!drag.band) drag.band = el('div', 'band' + (drag.type === 'cover' ? ' cover' : ''), p.scaled);
         const bx = Math.min(x, drag.start[0]), by = Math.min(y, drag.start[1]);
         Object.assign(drag.band.style, {
           left: bx + 'px', top: by + 'px', width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px'
@@ -598,10 +785,12 @@
       }
       if (!drag.pushed) {
         if (Math.hypot(dx, dy) * zoom() < 2) return;
-        d.undo.push({ deleted: [...d.deleted], overlays: clone(d.overlays.map(o => {
-          const st = drag.orig.find(s => s.o === o);
+        const snap = snapshot(d);
+        snap.overlays = clone(d.overlays.map(o => {
+          const st = drag.orig.find(t => t.o === o);
           return st ? Object.assign({}, o, { x: st.x, y: st.y, w: st.w, h: st.h, size: st.size }) : o;
-        })) });
+        }));
+        d.undo.push(snap);
         d.redo = [];
         markDirty(d);
         updateButtons();
@@ -618,7 +807,11 @@
         const s = drag.orig.find(t => t.o === drag.ov) || { o: drag.ov, w: drag.ov.w, h: drag.ov.h, size: drag.ov.size };
         const o = s.o;
         const div = ovDiv(d, o);
-        if (o.type === 'image') {
+        if (o.type === 'rect') {
+          o.w = Math.max(2, s.w + dx);
+          o.h = Math.max(2, s.h + dy);
+          if (div) { div.style.width = o.w + 'px'; div.style.height = o.h + 'px'; }
+        } else if (o.type === 'image') {
           const ratio = s.h / s.w;
           o.w = Math.max(10, s.w + dx);
           o.h = o.w * ratio;
@@ -638,6 +831,20 @@
       const dr = drag;
       drag = null;
       const [x, y] = pagePoint(p, ev);
+      if (dr.type === 'cover') {
+        if (dr.band) dr.band.remove();
+        const r = [Math.min(x, dr.start[0]), Math.min(y, dr.start[1]), Math.abs(x - dr.start[0]), Math.abs(y - dr.start[1])];
+        if (r[2] < 2 || r[3] < 2) return;
+        pushUndo(d);
+        const { bg } = sampleColors(p, r);
+        const ov = { id: nextOvId(d), page: pageIndex, type: 'rect', color: bg, x: r[0], y: r[1], w: r[2], h: r[3] };
+        d.overlays.push(ov);
+        d.sel.clear();
+        d.sel.add('o' + ov.id);
+        renderOverlays(d);
+        updateCtx();
+        return;
+      }
       if (dr.type === 'band') {
         if (dr.band) {
           dr.band.remove();
@@ -729,18 +936,40 @@
     }
 
     const info = el('span', 'info', bar);
-    if (els.length === 1 && !ovs.length) {
+    if (ovs.length === 1 && !els.length && ovs[0].type === 'rect') {
+      const ov = ovs[0];
+      info.textContent = 'Abdeckung';
+      const col = el('input', '', bar);
+      col.type = 'color'; col.value = ov.color; col.title = 'Farbe der Abdeckung';
+      col.onchange = () => { pushUndo(d); ov.color = col.value; renderOverlays(d); };
+    } else if (els.length === 1 && !ovs.length) {
       const e = els[0];
-      const names = { text: 'Text', image: 'Bild', path: 'Grafik/Linie', annot: 'Anmerkung', form: 'Wasserzeichen-Gruppe' };
-      info.textContent = (e.wm ? 'Mögliches Wasserzeichen · ' : '') + names[e.kind] +
-        (e.kind === 'text' ? ': „' + e.text.trim() + '“' : '') +
-        (e.kind === 'annot' && e.sub ? ' (' + e.sub + ')' : '');
-      if (e.kind === 'text') btn('Text ändern', () => editOriginalText(d, e), 'primary');
+      const names = { text: 'Text', image: 'Bild', path: 'Grafik/Linie', annot: 'Anmerkung/Feld', form: 'Wasserzeichen-Gruppe' };
+      let label = (e.wm ? 'Mögliches Wasserzeichen · ' : '') + names[e.kind];
+      if (e.kind === 'text') {
+        label = (e.invisible || e.ocr ? 'Scan-Text' : label) + ': „' + curText(d, e) + '“';
+        if (!e.ocr) {
+          const st = e.style;
+          const font = [st.name || { sans: 'Sans', serif: 'Serif', mono: 'Mono' }[st.family], st.bold ? 'fett' : '',
+            st.italic ? 'kursiv' : '', (Math.round(e.size * 10) / 10) + ' pt'].filter(Boolean).join(' · ');
+          const fi = el('span', 'fontinfo', bar);
+          fi.textContent = font;
+          fi.title = 'Erkannte Schrift – wird beim Ändern beibehalten';
+          fi.style.order = 1;
+        }
+      }
+      if (e.kind === 'annot' && e.sub) label += ' (' + e.sub + ')';
+      info.textContent = label;
+      info.title = label;
+      if (e.kind === 'text') {
+        const b = btn('Text ändern', () => editOriginalText(d, e), 'primary');
+        b.style.order = 2;
+      }
     } else {
       info.textContent = (els.length + ovs.length) + ' Elemente ausgewählt';
     }
-    btn('Löschen', deleteSelection, 'danger', 'Entfernen (Entf)');
-    btn('Abwählen', () => setSel(d, []));
+    btn('Löschen', deleteSelection, 'danger', 'Entfernen (Entf)').style.order = 3;
+    btn('Abwählen', () => setSel(d, [])).style.order = 4;
   }
 
   /* ------------------------------------------------------------------ *
@@ -750,6 +979,7 @@
     state.tool = t;
     document.querySelectorAll('#tools [data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
     document.body.classList.toggle('tool-text', t === 'text');
+    document.body.classList.toggle('tool-cover', t === 'cover');
   }
 
   // Seite, die gerade am meisten sichtbar ist
@@ -909,6 +1139,120 @@
     });
   }
 
+  /* ------------------------------------------------------------------ *
+   *  Texterkennung (OCR) für eingescannte Seiten – läuft lokal im Browser
+   * ------------------------------------------------------------------ */
+  let ocrWorkerP = null;
+  let ocrLabel = '';
+
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const sc = document.createElement('script');
+      sc.src = src;
+      sc.onload = res;
+      sc.onerror = () => rej(new Error('Skript nicht ladbar: ' + src));
+      document.head.appendChild(sc);
+    });
+  }
+
+  function ocrWorker() {
+    if (!ocrWorkerP) {
+      ocrWorkerP = (async () => {
+        if (!window.Tesseract) await loadScript('vendor/tesseract/tesseract.min.js');
+        const abs = u => new URL(u, location.href).href;
+        return Tesseract.createWorker('deu', 1, {
+          workerPath: abs('vendor/tesseract/worker.min.js'),
+          corePath: abs('vendor/tesseract/'),
+          langPath: abs('vendor/tesseract/lang'),
+          gzip: true,
+          logger: m => {
+            if (m.status === 'recognizing text' && ocrLabel) busy(ocrLabel + ' ' + Math.round(m.progress * 100) + ' %');
+          }
+        });
+      })();
+      ocrWorkerP.catch(() => { ocrWorkerP = null; });
+    }
+    return ocrWorkerP;
+  }
+
+  async function runOcr() {
+    const d = doc();
+    if (!d) { toast('Öffne zuerst eine PDF.'); return; }
+    commitEditing();
+    busy('Lade Texterkennung … (beim ersten Mal ein paar Sekunden)');
+    let added = 0;
+    try {
+      const worker = await ocrWorker();
+      const run = Date.now().toString(36);
+      for (let i = 0; i < d.pages.length; i++) {
+        const p = d.pages[i];
+        ocrLabel = 'Texterkennung Seite ' + (i + 1) + '/' + d.pages.length + ' …';
+        busy(ocrLabel);
+        const page = await d.pdfjs.getPage(i + 1);
+        const scale = 3;
+        const vp = page.getViewport({ scale });
+        const c = document.createElement('canvas');
+        c.width = Math.ceil(vp.width);
+        c.height = Math.ceil(vp.height);
+        const g = c.getContext('2d');
+        g.fillStyle = '#fff';
+        g.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: g, viewport: vp }).promise;
+        const { data } = await worker.recognize(c);
+
+        // alte OCR-Ergebnisse dieser Seite ersetzen
+        for (const e of p.elements) if (e.ocr) { const div = p.elDivs.get(e.id); if (div) div.remove(); p.elDivs.delete(e.id); }
+        p.elements = p.elements.filter(e => !e.ocr);
+        const native = p.elements.filter(e => e.kind === 'text' && !e.invisible && !isDeleted(d, e));
+        const list = [];
+        for (const line of data.lines || []) {
+          const words = (line.words || []).filter(w => w.text.trim() && w.confidence > 30);
+          if (!words.length) continue;
+          const lh = line.bbox.y1 - line.bbox.y0;
+          // Zeile an großen Lücken (Spalten, Tabellen) aufteilen
+          const segs = [];
+          let cur = null;
+          for (const w of words) {
+            if (cur && w.bbox.x0 - cur.x1 < lh * 1.1) {
+              cur.text += ' ' + w.text;
+              cur.x1 = w.bbox.x1;
+              cur.y0 = Math.min(cur.y0, w.bbox.y0);
+              cur.y1 = Math.max(cur.y1, w.bbox.y1);
+            } else {
+              cur = { text: w.text, x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1 };
+              segs.push(cur);
+            }
+          }
+          for (const sg of segs) {
+            const r = [sg.x0 / scale, sg.y0 / scale, (sg.x1 - sg.x0) / scale, (sg.y1 - sg.y0) / scale];
+            const cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
+            // Text, der schon als echter PDF-Text existiert, nicht doppelt anlegen
+            if (native.some(e => cx >= e.r[0] && cx <= e.r[0] + e.r[2] && cy >= e.r[1] && cy <= e.r[1] + e.r[3])) continue;
+            // Schriftgröße aus der Zeilenhöhe (Oberlänge bis Grundlinie ≈ 0,94 em)
+            const rowH = line.rowAttributes && line.rowAttributes.row_height ? line.rowAttributes.row_height : lh / 1.1;
+            list.push({ id: 'ocr' + run + ':' + i + ':' + list.length, page: i, r, text: sg.text, size: Math.max(4, Math.round(rowH / scale / 0.94 * 2) / 2) });
+          }
+        }
+        d.ocr[i] = list;
+        for (const o of list) {
+          const e = ocrElement(o);
+          p.elements.push(e);
+          addElementDiv(p, e);
+        }
+        added += list.length;
+      }
+      refreshElementState(d);
+      toast(added ? added + ' Textstellen erkannt – anklicken zum Löschen, Doppelklick zum Ändern.'
+        : 'Kein zusätzlicher Text gefunden.', 6000);
+    } catch (e) {
+      console.error(e);
+      toast('Texterkennung fehlgeschlagen: ' + (e.message || e), 6000);
+    } finally {
+      ocrLabel = '';
+      busy(null);
+    }
+  }
+
   function findWatermarks() {
     const d = doc();
     if (!d) return;
@@ -916,7 +1260,7 @@
     let first = null;
     for (const p of d.pages) {
       for (const e of p.elements) {
-        if (e.wm && !isDeleted(d, e)) {
+        if (e.wm && !e.wmGroup && !e.invisible && !isDeleted(d, e)) {
           keys.push('e' + e.id);
           if (!first) first = p.elDivs.get(e.id);
         }
@@ -1089,6 +1433,7 @@
       $('dlgSign').showModal();
     };
     $('btnWm').onclick = findWatermarks;
+    $('btnOcr').onclick = runOcr;
     $('chkShow').onchange = ev => {
       state.showEls = ev.target.checked;
       for (const d of state.docs) d.view.classList.toggle('show-els', state.showEls);
@@ -1137,6 +1482,7 @@
       if (ev.key === 'Escape') { setSel(d, []); setTool('select'); return; }
       if (!mod && k === 'v') setTool('select');
       if (!mod && k === 't') setTool('text');
+      if (!mod && k === 'a') setTool('cover');
       if (ev.key.startsWith('Arrow')) {
         const ovs = selectedOverlays(d);
         if (!ovs.length) return;

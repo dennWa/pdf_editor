@@ -21,11 +21,13 @@
     <div class="group tools" id="tools">
       <button data-tool="select" class="active" title="Auswählen: Element anklicken oder Bereich aufziehen (V)">Auswählen</button>
       <button data-tool="text" title="Neuen Text einfügen (T)">Text</button>
+      <button data-tool="cover" title="Bereich in Hintergrundfarbe übermalen, z. B. bei Scans (A)">Abdecken</button>
       <button id="btnImage" title="Bild oder Unterschrift als Bild einfügen">Bild</button>
       <button id="btnSign" title="Unterschrift zeichnen">Unterschrift</button>
     </div>
     <div class="group">
       <button id="btnWm" title="Wasserzeichen automatisch suchen und markieren">Wasserzeichen finden</button>
+      <button id="btnOcr" title="Text in eingescannten Seiten erkennen (läuft lokal)">Text erkennen</button>
       <label class="toggle" title="Alle erkannten Elemente umrahmen"><input type="checkbox" id="chkShow" checked> Elemente zeigen</label>
     </div>
     <div class="group zoom">
@@ -48,12 +50,14 @@
         <div><i class="sw path"></i> Linie / Grafik</div>
         <div><i class="sw annot"></i> Stempel / Feld</div>
         <div><i class="sw wm"></i> Wasserzeichen?</div>
+        <div><i class="sw scan"></i> Scan-Text</div>
       </div>
       <div class="hint">
         <b>Tipps</b><br>
         Klick = auswählen · Doppelklick auf Text = ändern<br>
         Rahmen aufziehen = mehrere auswählen<br>
-        Entf = löschen · Umschalt+Klick = dazunehmen
+        Entf = löschen · Umschalt+Klick = dazunehmen<br>
+        Scan? → „Text erkennen“ oder „Abdecken“
       </div>
     </aside>
 
