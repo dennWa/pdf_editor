@@ -677,7 +677,7 @@
       });
       const resources = node.Resources ? node.Resources() : get(this.ctx, node, 'Resources');
       this.streams.get(key).resources = resources;
-      this.interpret(key, ops, resources, ID, elements, 0, new Set(), { wm: false, alpha: 1 });
+      this.streams.get(key).endDepth = this.interpret(key, ops, resources, ID, elements, 0, new Set(), { wm: false, alpha: 1 });
 
       // Anmerkungen (Stempel, Formularfelder, Freitext …)
       const annots = arr(this.ctx, node.get(N('Annots')));
@@ -992,12 +992,30 @@
           }
           default:
             if (PATH_BUILD.has(op)) {
-              if (!path) path = { start: i, pts: [], clip: false };
+              if (!path) path = { start: i, pts: [], clip: false, polys: [], cur: null };
               if (op === 're' && a.length >= 4) {
                 const [x, y, w, h] = a.map(Number);
-                path.pts.push(apply(gs.ctm, x, y), apply(gs.ctm, x + w, y), apply(gs.ctm, x, y + h), apply(gs.ctm, x + w, y + h));
+                const q = [apply(gs.ctm, x, y), apply(gs.ctm, x + w, y), apply(gs.ctm, x + w, y + h), apply(gs.ctm, x, y + h)];
+                path.pts.push(...q);
+                path.polys.push(q);
               } else {
                 for (let j = 0; j + 1 < a.length; j += 2) path.pts.push(apply(gs.ctm, +a[j], +a[j + 1]));
+                // Umriss als Polygon mitschreiben (für Fläche/Umfang → Strichstärke)
+                const P = (x, y) => apply(gs.ctm, +x, +y);
+                const poly = path.polys[path.polys.length - 1];
+                if (op === 'm') { path.polys.push([P(a[0], a[1])]); }
+                else if (poly && op === 'l') poly.push(P(a[0], a[1]));
+                else if (poly && (op === 'c' || op === 'v' || op === 'y')) {
+                  const p0 = poly[poly.length - 1];
+                  const p1 = op === 'v' ? p0 : P(a[0], a[1]);
+                  const p2 = op === 'v' ? P(a[0], a[1]) : op === 'y' ? P(a[2], a[3]) : P(a[2], a[3]);
+                  const p3 = op === 'c' ? P(a[4], a[5]) : P(a[2], a[3]);
+                  for (let t = 1; t <= 6; t++) {
+                    const u = t / 6, v = 1 - u;
+                    poly.push([v * v * v * p0[0] + 3 * v * v * u * p1[0] + 3 * v * u * u * p2[0] + u * u * u * p3[0],
+                      v * v * v * p0[1] + 3 * v * v * u * p1[1] + 3 * v * u * u * p2[1] + u * u * u * p3[1]]);
+                  }
+                }
               }
             } else if (op === 'W' || op === 'W*') {
               if (path) path.clip = true;
@@ -1012,12 +1030,28 @@
                 const lw = gs.lw * Math.hypot(gs.ctm[0], gs.ctm[1]) / 2;
                 const bb = bboxOf(path.pts);
                 bb[0] -= lw; bb[1] -= lw; bb[2] += lw; bb[3] += lw;
-                elements.push({ kind: 'path', stream: streamKey, keys, bbox: bb, wm: inWM() || gs.alpha < 0.95 });
+                let area = 0, perim = 0;
+                for (const poly of path.polys) {
+                  let A = 0;
+                  for (let j = 0; j < poly.length; j++) {
+                    const [x1, y1] = poly[j], [x2, y2] = poly[(j + 1) % poly.length];
+                    A += x1 * y2 - x2 * y1;
+                    perim += Math.hypot(x2 - x1, y2 - y1);
+                  }
+                  area += A / 2;
+                }
+                elements.push({
+                  kind: 'path', stream: streamKey, keys, bbox: bb, wm: inWM() || gs.alpha < 0.95,
+                  area: Math.abs(area), perim,
+                  // für "Text als Grafik" (z. B. PDF24/Ghostscript): Lage und Farbe des Zeichens
+                  ctm: gs.ctm, fill: gs.fill.slice(), filled: op !== 'S' && op !== 's'
+                });
               }
               path = null;
             }
         }
       }
+      return stack.length;
     }
 
     // Content-Stream ohne gelöschte Operatoren erzeugen
@@ -1125,6 +1159,152 @@
       return out;
     }
 
+    /*
+     * Text, der nur als Grafik vorliegt: Die App meldet erkannte Zeilen (vectorEls) und
+     * gesammelte Buchstaben-Vorlagen (glyphs) an. Neuer Text wird aus den Original-Zeichnungen
+     * der Buchstaben zusammengesetzt – dadurch sieht er exakt aus wie die Schrift im Dokument.
+     */
+    setVectorText(vectorEls, glyphs) {
+      this.vectorEls = vectorEls || new Map();
+      this.glyphs = glyphs || new Map();
+    }
+
+    opsBytes(pathEl) {
+      const entry = this.streams.get(pathEl.stream);
+      const parts = [];
+      for (const k of pathEl.keys) {
+        const op = entry.ops[+k.slice(k.lastIndexOf(':') + 1)];
+        parts.push(latin1(entry.bytes.subarray(op.s, op.e)));
+      }
+      return parts.join('\n');
+    }
+
+    // Beste Vorlage für ein Zeichen: gleiche Zeile > gleiche Stärke > ähnliche Größe; Ausreißer verwerfen
+    pickGlyph(ch, info, id) {
+      let samples = (this.glyphs.get(ch) || []).filter(sm => sm.pathIds.every(pid => this.byId.has(pid)));
+      if (!samples.length) return null;
+      if (samples.length >= 3 && samples[0].w !== undefined) {
+        const med = key => { const a = samples.map(sm => sm[key]).sort((x, y) => x - y); return a[a.length >> 1]; };
+        const mw = med('w'), mh = med('h');
+        const ok = samples.filter(sm => Math.abs(sm.w - mw) <= Math.max(0.06, mw * 0.25) && Math.abs(sm.h - mh) <= Math.max(0.06, mh * 0.2));
+        if (ok.length) samples = ok;
+      }
+      let best = null, bestScore = Infinity;
+      for (const sm of samples) {
+        let score = Math.abs(Math.log(info.size / sm.size));
+        if (info.weight && sm.weight) {
+          const wr = Math.abs(Math.log(info.weight / sm.weight));
+          score += 3 * wr + (wr > Math.log(1.2) ? 1 : 0);
+        }
+        if (sm.el === id) score -= 1;
+        if (sm.page !== info.page) score += 0.05;
+        score -= (sm.conf || 0) / 2000;
+        if (score < bestScore) { best = sm; bestScore = score; }
+      }
+      return bestScore < 1.6 ? best : null;
+    }
+
+    // Zeichnung(en) eines Zeichens um dx verschoben erneut ausgeben
+    shiftedGlyph(ids, dx, col) {
+      const out = [];
+      for (const pid of ids) {
+        const pe = this.byId.get(pid);
+        if (!pe || !pe.ctm) continue;
+        const M = mul(pe.ctm, [1, 0, 0, 1, dx, 0]);
+        out.push('q ' + M.map(fmt).join(' ') + ' cm ' + col + '\n' + this.opsBytes(pe) + '\nQ');
+      }
+      return out.join('\n');
+    }
+
+    // Nur den geänderten Teil neu setzen; unveränderte Buchstaben bleiben die Originale
+    editVector(info, text, id) {
+      const chars = info.chars;
+      const allKeys = ids => ids.flatMap(pid => (this.byId.get(pid) || { keys: [] }).keys);
+      if (!chars || !chars.length) {
+        return { content: this.composeVector(info, text, id), del: info.keys };
+      }
+      const oldStr = chars.map(c => c.ch);
+      const neu = [...text];
+      let pre = 0;
+      while (pre < oldStr.length && pre < neu.length && oldStr[pre] === neu[pre]) pre++;
+      let suf = 0;
+      while (suf < oldStr.length - pre && suf < neu.length - pre &&
+        oldStr[oldStr.length - 1 - suf] === neu[neu.length - 1 - suf]) suf++;
+      const [r, g, b] = info.color || [0, 0, 0];
+      const col = fmt(r) + ' ' + fmt(g) + ' ' + fmt(b) + ' rg';
+      // Startpunkt des geänderten Mittelteils
+      const leftOf = k => {
+        for (let j = k; j < chars.length; j++) if (chars[j].ids) return chars[j].left - (j > k ? info.space : 0);
+        return null;
+      };
+      const rightBefore = k => {
+        for (let j = k - 1; j >= 0; j--) if (chars[j].ids) return chars[j].right + (j < k - 1 ? info.space : 0);
+        return info.x;
+      };
+      const midOld = chars.slice(pre, chars.length - suf);
+      let xStart = midOld.length ? (leftOf(pre) ?? rightBefore(pre)) : rightBefore(pre);
+      if (!midOld.length && pre > 0 && chars[pre - 1].ids) {
+        // reines Einfügen hinter einem Buchstaben: kleinen Buchstabenabstand lassen
+        xStart = chars[pre - 1].right + info.size * 0.07;
+      }
+      const sufOld = chars.slice(chars.length - suf);
+      const sufLeft = sufOld.find(c => c.ids);
+      const oldEnd = sufLeft ? sufLeft.left : null;
+      const midText = neu.slice(pre, neu.length - suf).join('');
+      const sub = Object.assign({}, info, { x: xStart });
+      let content = midText ? this.composeVector(sub, midText, id) : '';
+      const info2 = this.editInfo.get(id) || { missing: [], adv: 0 };
+      let xEnd = xStart + (midText ? info2.adv : 0);
+      if (midText && sufOld.length && sufOld[0].ch !== ' ') xEnd += info.size * 0.07;
+      const del = allKeys(midOld.filter(c => c.ids).flatMap(c => c.ids));
+      if (sufLeft) {
+        const dx = xEnd - oldEnd + (sufOld[0].ch === ' ' && !midText ? 0 : 0);
+        if (Math.abs(dx) > 0.01) {
+          for (const c of sufOld) {
+            if (!c.ids) continue;
+            content += '\n' + this.shiftedGlyph(c.ids, dx, col);
+            del.push(...allKeys(c.ids));
+          }
+        }
+      }
+      this.editInfo.set(id, { missing: info2.missing || [], fallback: info2.fallback || null, adv: 0 });
+      return { content, del };
+    }
+
+    composeVector(info, text, id) {
+      const out = [];
+      const missing = [];
+      let x = info.x;
+      const size = info.size;
+      const [r, g, b] = info.color || [0, 0, 0];
+      const col = fmt(r) + ' ' + fmt(g) + ' ' + fmt(b) + ' rg';
+      const pageEntry = this.streams.get('p' + info.page);
+      for (const ch of text) {
+        if (ch === ' ' || ch === '\u00A0') { x += info.space || size * 0.28; continue; }
+        const best = this.pickGlyph(ch, info, id);
+        if (best) {
+          const k = size / best.size;
+          for (const pid of best.pathIds) {
+            const pe = this.byId.get(pid);
+            if (!pe || !pe.ctm) continue;
+            const M = mul(pe.ctm, [k, 0, 0, k, x - best.refX * k, info.baseline - best.baseY * k]);
+            out.push('q ' + M.map(fmt).join(' ') + ' cm ' + col + '\n' + this.opsBytes(pe) + '\nQ');
+          }
+          x += best.adv * k;
+        } else {
+          missing.push(ch);
+          const fb = this.fallbackFontName(pageEntry.resources, { family: 'sans', bold: !!info.bold, italic: false });
+          let str = ch;
+          try { fb.font.encodeText(ch); } catch (e) { str = '?'; }
+          out.push('BT ' + col + ' ' + pdfName(fb.name) + ' ' + fmt(size) + ' Tf 1 0 0 1 ' + fmt(x) + ' ' +
+            fmt(info.baseline) + ' Tm ' + fb.font.encodeText(str).toString() + ' Tj ET');
+          x += fb.font.widthOfTextAtSize(str, size);
+        }
+      }
+      this.editInfo.set(id, { missing, fallback: missing.length ? stdFontName({ family: 'sans', bold: !!info.bold }) : null, adv: x - info.x });
+      return out.join('\n');
+    }
+
     // Formularfeld-Wert (/V) mitziehen, damit andere Programme den neuen Text anzeigen
     setFieldValue(annot, text) {
       const L = lib();
@@ -1145,7 +1325,8 @@
     }
 
     applyDeletions(deletedKeys, edits) {
-      const deleted = deletedKeys instanceof Set ? deletedKeys : new Set(deletedKeys);
+      let deleted = deletedKeys instanceof Set ? deletedKeys : new Set(deletedKeys);
+      const appendByPage = new Map();
       const byStream = new Map();
       const annotDel = new Map();
       // Textänderungen: erster Operator bekommt den neuen Text, die übrigen werden geleert
@@ -1154,6 +1335,17 @@
       this.editInfo.clear();
       if (edits) {
         for (const [id, text] of (edits instanceof Map ? edits : Object.entries(edits))) {
+          const vec = this.vectorEls && this.vectorEls.get(id);
+          if (vec) {
+            if (vec.keys.every(k => deleted.has(k))) continue;
+            // alte Buchstaben-Zeichnungen entfernen, neue anhängen
+            if (deleted === deletedKeys) deleted = new Set(deleted);
+            const res = this.editVector(vec, text, id);
+            res.del.forEach(k => deleted.add(k));
+            appendByPage.set(vec.page, (appendByPage.get(vec.page) || '') + res.content + '\n');
+            byStream.set('p' + vec.page, true);
+            continue;
+          }
           const el = this.byId.get(id);
           if (!el || el.kind !== 'text' || el.keys.every(k => deleted.has(k))) continue;
           el.ops.forEach((o, i) => {
@@ -1182,7 +1374,13 @@
         if (entry.kind === 'page') {
           const node = pages[entry.pageIndex].node;
           if (touched) {
-            const s = this.ctx.flateStream(this.rebuildStream(key, deleted, overrides));
+            let bytes = this.rebuildStream(key, deleted, overrides);
+            const add = appendByPage.get(entry.pageIndex);
+            if (add) {
+              // Original in q…Q kapseln, damit neue Inhalte im Standard-Koordinatensystem landen
+              bytes = concatBytes([toBytes('q\n'), bytes, toBytes('\n' + 'Q\n'.repeat((entry.endDepth || 0) + 1) + add)]);
+            }
+            const s = this.ctx.flateStream(bytes);
             node.set(N('Contents'), this.ctx.register(s));
           } else if (entry.origContents) {
             node.set(N('Contents'), entry.origContents);

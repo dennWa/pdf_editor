@@ -113,13 +113,21 @@
         pdfjs: null
       };
       state.docs.push(d);
+      d.glyphs = restore && restore.glyphs ? restore.glyphs : {};
       for (const [pi, list] of Object.entries(d.ocr)) {
         if (d.pages[pi]) d.pages[pi].elements.push(...list.map(ocrElement));
       }
+      registerVector(d);
       buildDocView(d);
       await render(d);
       activate(d);
-      const counts = d.pages.reduce((n, p) => n + p.elements.length, 0);
+      const auto = pagesNeedingOcr(d);
+      if (auto.length) {
+        busy(null);
+        await runOcr(d, auto, true);
+        return;
+      }
+      const counts = d.pages.reduce((n, p) => n + p.elements.filter(e => !e.absorbed).length, 0);
       const msg = d.pages.length + (d.pages.length === 1 ? ' Seite' : ' Seiten') + ', ' + counts + ' Elemente erkannt.';
       const scan = scanHint(d);
       toast(scan ? msg + ' ' + scan : msg, scan ? 9000 : 3500);
@@ -138,9 +146,43 @@
   // Gespeicherte Texterkennungs-Ergebnisse wieder zu Elementen machen
   function ocrElement(o) {
     return {
-      id: o.id, page: o.page, kind: 'text', ocr: true, keys: [], r: o.r.slice(), text: o.text, size: o.size,
-      style: { family: 'sans', bold: false, italic: false, name: null }, color: [0, 0, 0], wm: false, vang: 0
+      id: o.id, page: o.page, kind: 'text', ocr: true, vector: !!o.vector, keys: o.keys || [], r: o.r.slice(),
+      text: o.text, size: o.size, vorigin: o.vorigin,
+      style: { family: 'sans', bold: false, italic: false, name: null }, color: o.color || [0, 0, 0], wm: false, vang: 0
     };
+  }
+
+  // Erkannten Grafik-Text beim Scanner anmelden und die einzelnen Buchstaben-Zeichnungen ausblenden
+  function registerVector(d) {
+    const vec = new Map();
+    const absorbed = new Set();
+    for (const list of Object.values(d.ocr)) {
+      for (const o of list) {
+        if (!o.vector) continue;
+        vec.set(o.id, {
+          keys: o.keys, page: o.page, x: o.x, baseline: o.baseline, size: o.size, color: o.color, space: o.space,
+          weight: o.weight, chars: o.chars, text: o.text
+        });
+        o.absorbed.forEach(id => absorbed.add(id));
+      }
+    }
+    const glyphs = new Map(Object.entries(d.glyphs || {}));
+    d.scanner.setVectorText(vec, glyphs);
+    for (const p of d.pages) for (const e of p.elements) if (e.kind === 'path') e.absorbed = absorbed.has(e.id);
+  }
+
+  // Seiten ohne echten Text, aber mit Buchstaben-Grafiken oder Scan-Bild
+  function pagesNeedingOcr(d) {
+    const out = [];
+    d.pages.forEach((p, i) => {
+      if (d.ocr[i]) return;
+      const W = p.vp1.width, H = p.vp1.height;
+      const real = p.elements.filter(e => e.kind === 'text' && !e.ocr).length;
+      const glyphLike = p.elements.filter(isGlyphPath).length;
+      const big = p.elements.some(e => e.kind === 'image' && e.r[2] * e.r[3] > 0.5 * W * H);
+      if (real < 3 && (glyphLike > 30 || big)) out.push(i);
+    });
+    return out;
   }
 
   function scanHint(d) {
@@ -347,7 +389,7 @@
       if (!p.elDivs) continue;
       for (const e of p.elements) {
         const div = p.elDivs.get(e.id);
-        div.classList.toggle('deleted', isDeleted(d, e));
+            div.classList.toggle('deleted', isDeleted(d, e) || !!e.absorbed);
         div.classList.toggle('sel', d.sel.has('e' + e.id));
       }
     }
@@ -480,7 +522,7 @@
     const pad = 2;
     const prio = { text: 0, image: 1, annot: 2, form: 2, path: 3 };
     for (const e of p.elements) {
-      if (isDeleted(d, e)) continue;
+      if (e.absorbed || isDeleted(d, e)) continue;
       const [ex, ey, ew, eh] = e.r;
       if (x < ex - pad || x > ex + ew + pad || y < ey - pad || y > ey + eh + pad) continue;
       const area = Math.max(ew, 6) * Math.max(eh, 6) * (1 + prio[e.kind] * 0.15);
@@ -496,7 +538,7 @@
     const ovs = selectedOverlays(d);
     pushUndo(d);
     for (const e of els) {
-      if (e.invisible || e.ocr) coverElement(d, e);
+      if (e.invisible || (e.ocr && !e.keys.length)) coverElement(d, e);
       else e.keys.forEach(k => d.deleted.add(k));
     }
     d.overlays = d.overlays.filter(o => !ovs.includes(o));
@@ -560,7 +602,7 @@
   }
 
   function editOriginalText(d, e) {
-    if (e.invisible || e.ocr) return replaceScanText(d, e);
+    if (e.invisible || (e.ocr && !e.vector)) return replaceScanText(d, e);
     openInlineEditor(d, e);
   }
 
@@ -852,7 +894,7 @@
           const y0 = Math.min(y, dr.start[1]), y1 = Math.max(y, dr.start[1]);
           const keys = [];
           for (const e of p.elements) {
-            if (isDeleted(d, e)) continue;
+            if (e.absorbed || isDeleted(d, e)) continue;
             const [ex, ey, ew, eh] = e.r;
             if (ex >= x0 - 1 && ey >= y0 - 1 && ex + ew <= x1 + 1 && ey + eh <= y1 + 1) keys.push('e' + e.id);
           }
@@ -1175,75 +1217,45 @@
     return ocrWorkerP;
   }
 
-  async function runOcr() {
-    const d = doc();
+  async function runOcr(d, pageList, auto) {
+    d = d || doc();
     if (!d) { toast('Öffne zuerst eine PDF.'); return; }
     commitEditing();
+    const pagesToDo = pageList || d.pages.map((_, i) => i);
     busy('Lade Texterkennung … (beim ersten Mal ein paar Sekunden)');
-    let added = 0;
+    let added = 0, vectorCount = 0;
     try {
       const worker = await ocrWorker();
       const run = Date.now().toString(36);
-      for (let i = 0; i < d.pages.length; i++) {
+      for (const i of pagesToDo) {
         const p = d.pages[i];
-        ocrLabel = 'Texterkennung Seite ' + (i + 1) + '/' + d.pages.length + ' …';
+        ocrLabel = 'Texterkennung Seite ' + (i + 1) + ' von ' + d.pages.length + ' …';
         busy(ocrLabel);
-        const page = await d.pdfjs.getPage(i + 1);
         const scale = 3;
-        const vp = page.getViewport({ scale });
-        const c = document.createElement('canvas');
-        c.width = Math.ceil(vp.width);
-        c.height = Math.ceil(vp.height);
-        const g = c.getContext('2d');
-        g.fillStyle = '#fff';
-        g.fillRect(0, 0, c.width, c.height);
-        await page.render({ canvasContext: g, viewport: vp }).promise;
+        const c = await renderForOcr(d, i, scale);
         const { data } = await worker.recognize(c);
-
-        // alte OCR-Ergebnisse dieser Seite ersetzen
+        const list = ocrPage(d, p, i, data, scale, run);
+        // alte Ergebnisse dieser Seite ersetzen
         for (const e of p.elements) if (e.ocr) { const div = p.elDivs.get(e.id); if (div) div.remove(); p.elDivs.delete(e.id); }
         p.elements = p.elements.filter(e => !e.ocr);
-        const native = p.elements.filter(e => e.kind === 'text' && !e.invisible && !isDeleted(d, e));
-        const list = [];
-        for (const line of data.lines || []) {
-          const words = (line.words || []).filter(w => w.text.trim() && w.confidence > 30);
-          if (!words.length) continue;
-          const lh = line.bbox.y1 - line.bbox.y0;
-          // Zeile an großen Lücken (Spalten, Tabellen) aufteilen
-          const segs = [];
-          let cur = null;
-          for (const w of words) {
-            if (cur && w.bbox.x0 - cur.x1 < lh * 1.1) {
-              cur.text += ' ' + w.text;
-              cur.x1 = w.bbox.x1;
-              cur.y0 = Math.min(cur.y0, w.bbox.y0);
-              cur.y1 = Math.max(cur.y1, w.bbox.y1);
-            } else {
-              cur = { text: w.text, x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1 };
-              segs.push(cur);
-            }
-          }
-          for (const sg of segs) {
-            const r = [sg.x0 / scale, sg.y0 / scale, (sg.x1 - sg.x0) / scale, (sg.y1 - sg.y0) / scale];
-            const cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
-            // Text, der schon als echter PDF-Text existiert, nicht doppelt anlegen
-            if (native.some(e => cx >= e.r[0] && cx <= e.r[0] + e.r[2] && cy >= e.r[1] && cy <= e.r[1] + e.r[3])) continue;
-            // Schriftgröße aus der Zeilenhöhe (Oberlänge bis Grundlinie ≈ 0,94 em)
-            const rowH = line.rowAttributes && line.rowAttributes.row_height ? line.rowAttributes.row_height : lh / 1.1;
-            list.push({ id: 'ocr' + run + ':' + i + ':' + list.length, page: i, r, text: sg.text, size: Math.max(4, Math.round(rowH / scale / 0.94 * 2) / 2) });
-          }
-        }
         d.ocr[i] = list;
         for (const o of list) {
           const e = ocrElement(o);
           p.elements.push(e);
           addElementDiv(p, e);
+          if (o.vector) vectorCount++;
         }
         added += list.length;
       }
+      registerVector(d);
       refreshElementState(d);
-      toast(added ? added + ' Textstellen erkannt – anklicken zum Löschen, Doppelklick zum Ändern.'
-        : 'Kein zusätzlicher Text gefunden.', 6000);
+      if (vectorCount) {
+        toast('Diese PDF enthält Text nur als Grafik (z. B. über PDF24 gedruckt). ' + vectorCount +
+          ' Textstellen erkannt – Doppelklick zum Ändern, die Buchstaben werden aus dem Original zusammengesetzt.', 9000);
+      } else {
+        toast(added ? added + ' Textstellen erkannt – anklicken zum Löschen, Doppelklick zum Ändern.'
+          : 'Kein zusätzlicher Text gefunden.', 6000);
+      }
     } catch (e) {
       console.error(e);
       toast('Texterkennung fehlgeschlagen: ' + (e.message || e), 6000);
@@ -1253,17 +1265,281 @@
     }
   }
 
+  const isGlyphPath = e => e.kind === 'path' && e.filled && e.ctm && e.r[3] < 40 && e.r[2] < 60;
+
+  // Seite für die Texterkennung rendern. Liegt Text als Grafik vor, werden vorher alle anderen
+  // Elemente (Wasserzeichen, Linien, Bilder) ausgeblendet – das macht die Erkennung viel sauberer.
+  async function renderForOcr(d, i, scale) {
+    const p = d.pages[i];
+    let pdf = d.pdfjs, tmp = null;
+    const glyphs = p.elements.filter(isGlyphPath).length;
+    if (glyphs > 30) {
+      const del = new Set(d.deleted);
+      for (const e of p.elements) if (!isGlyphPath(e) && !e.ocr) e.keys.forEach(k => del.add(k));
+      d.scanner.applyDeletions(del, d.edits);
+      const bytes = await d.scanner.doc.save({ useObjectStreams: false });
+      d.scanner.applyDeletions(d.deleted, d.edits);
+      tmp = await pdfjsLib.getDocument(Object.assign({ data: bytes }, window.PDF_OPTS)).promise;
+      pdf = tmp;
+    }
+    try {
+      const page = await pdf.getPage(i + 1);
+      const vp = page.getViewport({ scale });
+      const c = document.createElement('canvas');
+      c.width = Math.ceil(vp.width);
+      c.height = Math.ceil(vp.height);
+      const g = c.getContext('2d');
+      g.fillStyle = '#fff';
+      g.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: g, viewport: vp, annotationMode: pdfjsLib.AnnotationMode.DISABLE }).promise;
+      return c;
+    } finally {
+      if (tmp) tmp.destroy();
+    }
+  }
+
+  const DESC = new Set([...'gjpqyQ,;()[]{}/|@$µ']);
+  const CAPS = /^[A-PR-Z0-9ÄÖÜ]$/;
+  const XLOW = /^[acemnorsuvwxz]$/;
+
+  // Lage, Grundlinie und Schriftgröße direkt aus den Buchstaben-Zeichnungen bestimmen (PDF-Koordinaten)
+  function vectorGeometry(paths, placed, fallbackSize) {
+    const x0 = Math.min(...paths.map(e => e.bbox[0]));
+    const median = a => { const b = a.slice().sort((m, n) => m - n); return b[b.length >> 1]; };
+    const noDesc = placed.filter(pl => pl.ps.length && !pl.junk && !DESC.has(pl.sy.text));
+    const bottoms = (noDesc.length ? noDesc.flatMap(pl => pl.ps) : paths).map(e => e.bbox[1]);
+    const baseline = median(bottoms);
+    const capH = placed.filter(pl => pl.ps.length && CAPS.test(pl.sy.text))
+      .map(pl => Math.max(...pl.ps.map(e => e.bbox[3])) - baseline);
+    const xH = placed.filter(pl => pl.ps.length && XLOW.test(pl.sy.text))
+      .map(pl => Math.max(...pl.ps.map(e => e.bbox[3])) - baseline);
+    let size;
+    if (capH.length) size = median(capH) / 0.716;
+    else if (xH.length) size = median(xH) / 0.519;
+    else size = Math.max(...paths.map(e => e.bbox[3])) - baseline > 0 ? (Math.max(...paths.map(e => e.bbox[3])) - baseline) / 0.73 : fallbackSize;
+    size = Math.round(size * 4) / 4;
+    const top = Math.min(...paths.map(e => e.r[1]));
+    const left = Math.min(...paths.map(e => e.r[0]));
+    const r = [left, top, Math.max(...paths.map(e => e.r[0] + e.r[2])) - left, Math.max(...paths.map(e => e.r[1] + e.r[3])) - top];
+    return {
+      vector: true, keys: paths.flatMap(e => e.keys), absorbed: paths.map(e => e.id), color: paths[0].fill,
+      x: x0, baseline, size, r
+    };
+  }
+
+  // Original-Zeichnung je Zeichen als Vorlage merken
+  function collectGlyphs(glyphs, placed, o, page) {
+    // Ziffern nur aus Zahlen, Buchstaben nur aus Wörtern übernehmen (verhindert O/0-, l/1-Verwechslungen)
+    const kind = ch => /[0-9]/.test(ch) ? 'd' : /\p{L}/u.test(ch) ? 'l' : 'o';
+    placed.forEach((pl, k) => {
+      if (!pl.ps.length || pl.sy.confidence < 75) return;
+      const ch = pl.sy.text;
+      const word = [...pl.word.text].filter(c => kind(c) !== 'o');
+      const kc = kind(ch);
+      if (kc !== 'o' && word.length > 1 && word.filter(c => kind(c) === kc).length / word.length < 0.75) return;
+      const left = Math.min(...pl.ps.map(e => e.bbox[0]));
+      const right = Math.max(...pl.ps.map(e => e.bbox[2]));
+      const next = placed.slice(k + 1).find(n => n.ps.length && n.word === pl.word);
+      const adv = next ? Math.min(...next.ps.map(e => e.bbox[0])) - left : right - left + o.size * 0.07;
+      if (adv <= 0 || adv > o.size * 2) return;
+      const arr = glyphs[ch] || (glyphs[ch] = []);
+      if (arr.some(a => a.el === o.id)) return;
+      if (arr.length >= 40) return;
+      const top = Math.max(...pl.ps.map(e => e.bbox[3]));
+      arr.push({
+        page, el: o.id, pathIds: pl.ps.map(e => e.id), refX: left, baseY: o.baseline, size: o.size, adv,
+        weight: pl.weight, conf: pl.sy.confidence, w: (right - left) / o.size, h: (top - o.baseline) / o.size
+      });
+    });
+  }
+
+  // Buchstaben-Zeichnungen ohne Lesung zu Wörtern gruppieren (gleiche Grundlinie, kleine Abstände)
+  function clusterGlyphs(paths) {
+    const sorted = paths.slice().sort((a, b) => a.bbox[0] - b.bbox[0]);
+    const groups = [];
+    for (const e of sorted) {
+      const h = e.bbox[3] - e.bbox[1];
+      const g = groups.find(gr => Math.abs(gr.base - e.bbox[1]) < Math.max(gr.h, h) * 0.35 &&
+        e.bbox[0] - gr.right < Math.max(gr.h, h) * 0.6 && e.bbox[0] >= gr.left - 1);
+      if (g) {
+        g.items.push(e);
+        g.right = Math.max(g.right, e.bbox[2]);
+        g.h = Math.max(g.h, h);
+      } else {
+        groups.push({ items: [e], base: e.bbox[1], left: e.bbox[0], right: e.bbox[2], h });
+      }
+    }
+    return groups.map(gr => gr.items);
+  }
+
+  // OCR-Ergebnis einer Seite in Elemente umsetzen; Buchstaben-Grafiken werden zugeordnet
+  function ocrPage(d, p, i, data, scale, run) {
+    const vp = p.vp1;
+    const toUser = (x, y) => vp.convertToPdfPoint(x, y);
+    const native = p.elements.filter(e => e.kind === 'text' && !e.invisible && !e.ocr && !isDeleted(d, e));
+    const glyphPaths = p.elements.filter(e => isGlyphPath(e) && !isDeleted(d, e));
+    const used = new Set();
+    const inside = (e, r, padY) => {
+      const cx = e.r[0] + e.r[2] / 2, cy = e.r[1] + e.r[3] / 2;
+      return cx >= r[0] && cx <= r[0] + r[2] && cy >= r[1] - padY && cy <= r[1] + r[3] + padY;
+    };
+    const list = [];
+    for (const line of data.lines || []) {
+      const words = (line.words || []).filter(w => w.text.trim() && w.confidence > 30);
+      if (!words.length) continue;
+      const lh = line.bbox.y1 - line.bbox.y0;
+      const bl = line.baseline || {};
+      const baseAt = x => {
+        if (bl.has_baseline === false || bl.y0 === undefined) return line.bbox.y1;
+        return bl.y0 + (bl.y1 - bl.y0) * (x - bl.x0) / ((bl.x1 - bl.x0) || 1);
+      };
+      const rowH = line.rowAttributes && line.rowAttributes.row_height ? line.rowAttributes.row_height : lh / 1.1;
+      const size = Math.max(4, Math.round(rowH / scale / 0.94 * 2) / 2);
+      // Zeile an großen Lücken (Spalten, Tabellen) aufteilen
+      const segs = [];
+      let cur = null;
+      for (const w of words) {
+        if (cur && w.bbox.x0 - cur.x1 < lh * 1.1) {
+          cur.gaps.push(w.bbox.x0 - cur.x1);
+          cur.words.push(w);
+          cur.x1 = w.bbox.x1;
+          cur.y0 = Math.min(cur.y0, w.bbox.y0);
+          cur.y1 = Math.max(cur.y1, w.bbox.y1);
+        } else {
+          cur = { words: [w], gaps: [], x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1 };
+          segs.push(cur);
+        }
+      }
+      for (const sg of segs) {
+        const text = sg.words.map(w => w.text).join(' ');
+        const r = [sg.x0 / scale, sg.y0 / scale, (sg.x1 - sg.x0) / scale, (sg.y1 - sg.y0) / scale];
+        const cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
+        if (native.some(e => cx >= e.r[0] && cx <= e.r[0] + e.r[2] && cy >= e.r[1] && cy <= e.r[1] + e.r[3])) continue;
+        const o = { id: 'ocr' + run + ':' + i + ':' + list.length, page: i, r, text, size };
+        let paths = glyphPaths.filter(e => !used.has(e.id) && e.r[3] <= r[3] * 1.6 + 1 && inside(e, r, r[3] * 0.2));
+        if (paths.length) {
+          // nur Zeichnungen auf der Grundlinie dieser Zeile (Nachbarzeilen bei engem Zeilenabstand ausschließen)
+          const hs = paths.map(e => e.r[3]).sort((m, n) => m - n);
+          const medH = hs[hs.length >> 1];
+          const base = baseAt((sg.x0 + sg.x1) / 2) / scale;
+          paths = paths.filter(e => {
+            const c = e.r[1] + e.r[3] / 2;
+            return c > base - 1.6 * medH && c < base + 0.35 * medH;
+          });
+        }
+        if (paths.length) {
+          paths.forEach(e => used.add(e.id));
+          // Zeichnungen zu Buchstaben bündeln (i-Punkt, Umlaut-Punkte gehören zum Buchstaben darunter)
+          const sortedP = paths.slice().sort((a, b) => (a.r[0] + a.r[2] / 2) - (b.r[0] + b.r[2] / 2));
+          const clusters = [];
+          for (const e of sortedP) {
+            const last = clusters[clusters.length - 1];
+            if (last) {
+              const ov = Math.min(last.x1, e.r[0] + e.r[2]) - Math.max(last.x0, e.r[0]);
+              if (ov > 0 && ov > 0.5 * Math.min(last.x1 - last.x0, e.r[2])) {
+                last.ps.push(e);
+                last.x0 = Math.min(last.x0, e.r[0]);
+                last.x1 = Math.max(last.x1, e.r[0] + e.r[2]);
+                continue;
+              }
+            }
+            clusters.push({ ps: [e], x0: e.r[0], x1: e.r[0] + e.r[2] });
+          }
+          // Bündel den gelesenen Wörtern zuordnen und je Wort der Reihe nach den Buchstaben
+          const byWord = sg.words.map(() => []);
+          for (const cl of clusters) {
+            const cx = (cl.x0 + cl.x1) / 2 * scale;
+            let bi = 0, bd = Infinity;
+            sg.words.forEach((w, k) => {
+              const dd = cx < w.bbox.x0 ? w.bbox.x0 - cx : cx > w.bbox.x1 ? cx - w.bbox.x1 : 0;
+              if (dd < bd) { bd = dd; bi = k; }
+            });
+            byWord[bi].push(cl);
+          }
+          const placed = [];
+          sg.words.forEach((w, k) => {
+            const chs = [...w.text];
+            const cls = byWord[k];
+            if (chs.length === cls.length) {
+              chs.forEach((ch, j) => {
+                const cl = cls[j];
+                const top = Math.min(...cl.ps.map(e => e.r[1])), bot = Math.max(...cl.ps.map(e => e.r[1] + e.r[3]));
+                placed.push({ sy: { text: ch, confidence: w.confidence }, sr: [cl.x0, top, cl.x1 - cl.x0, bot - top], ps: cl.ps, word: w });
+              });
+            } else {
+              // Anzahl passt nicht (Erkennungsfehler): Wort ohne Zuordnung
+              chs.forEach(ch => placed.push({ sy: { text: ch, confidence: 0 }, sr: [0, 0, 0, 0], ps: [], word: w }));
+              cls.forEach(cl => placed.push({ sy: { text: '', confidence: 0 }, sr: [0, 0, 0, 0], ps: cl.ps, word: w, junk: true }));
+            }
+          });
+          Object.assign(o, vectorGeometry(paths, placed, size));
+          // Strichstärke je Buchstabe aus der Vektorform: 2·Fläche/Umfang, relativ zur Schriftgröße
+          // (fett/normal kann innerhalb einer Zeile wechseln)
+          for (const pl of placed) {
+            if (pl.junk || !pl.ps.length) continue;
+            const A = pl.ps.reduce((n, e) => n + (e.area || 0), 0), P = pl.ps.reduce((n, e) => n + (e.perim || 0), 0);
+            pl.weight = P > 0 ? 2 * A / P / o.size : 0;
+          }
+          const wts = placed.filter(pl => pl.weight && !pl.junk).map(pl => pl.weight).sort((m, n) => m - n);
+          o.weight = wts.length ? wts[wts.length >> 1] : 0;
+          // Zeichenfolge mit Original-Zeichnungen (für "nur Geändertes neu setzen")
+          o.chars = [];
+          let complete = true;
+          let prevWord = null;
+          for (const pl of placed) {
+            if (prevWord && pl.word !== prevWord) o.chars.push({ ch: ' ' });
+            prevWord = pl.word;
+            if (pl.junk || !pl.ps.length) { complete = false; continue; }
+            o.chars.push({
+              ch: pl.sy.text, ids: pl.ps.map(e => e.id),
+              left: Math.min(...pl.ps.map(e => e.bbox[0])), right: Math.max(...pl.ps.map(e => e.bbox[2]))
+            });
+          }
+          const assigned = new Set(placed.flatMap(pl => pl.ps.map(e => e.id)));
+          if (!complete || paths.some(e => !assigned.has(e.id))) o.chars = null;
+          else o.text = o.chars.map(c => c.ch).join('');
+          o.id = 'ocr' + run + ':' + i + ':' + list.length;
+          o.vorigin = vp.convertToViewportPoint(o.x, o.baseline);
+          const gaps = sg.gaps.slice().sort((a, b) => a - b);
+          o.space = gaps.length ? Math.max(o.size * 0.2, gaps[gaps.length >> 1] / scale) : o.size * 0.28;
+          collectGlyphs(d.glyphs, placed, o, i);
+        }
+        list.push(o);
+      }
+    }
+    // Übrig gebliebene Buchstaben-Zeichnungen (nicht gelesen) wenigstens wortweise anklickbar machen
+    const rest = glyphPaths.filter(e => !used.has(e.id));
+    for (const grp of clusterGlyphs(rest)) {
+      const o = Object.assign({ id: 'ocr' + run + ':' + i + ':' + list.length, page: i, text: '' },
+        vectorGeometry(grp, [], 10));
+      o.vorigin = vp.convertToViewportPoint(o.x, o.baseline);
+      o.space = o.size * 0.28;
+      list.push(o);
+    }
+    return list;
+  }
+
   function findWatermarks() {
     const d = doc();
     if (!d) return;
     const keys = [];
     let first = null;
     for (const p of d.pages) {
-      for (const e of p.elements) {
-        if (e.wm && !e.wmGroup && !e.invisible && !isDeleted(d, e)) {
-          keys.push('e' + e.id);
-          if (!first) first = p.elDivs.get(e.id);
-        }
+      let found = p.elements.filter(e => e.wm && !e.wmGroup && !e.invisible && !isDeleted(d, e));
+      if (!found.length) {
+        // kein markiertes Wasserzeichen: große Bilder, die über viel Text liegen, sind verdächtig
+        const area = p.vp1.width * p.vp1.height;
+        const texts = p.elements.filter(e => e.kind === 'text' && !isDeleted(d, e));
+        found = p.elements.filter(e => {
+          if (e.kind !== 'image' || isDeleted(d, e) || e.r[2] * e.r[3] < area * 0.08 || e.r[2] * e.r[3] > area * 0.9) return false;
+          const over = texts.filter(t => t.r[0] < e.r[0] + e.r[2] && t.r[0] + t.r[2] > e.r[0] &&
+            t.r[1] < e.r[1] + e.r[3] && t.r[1] + t.r[3] > e.r[1]).length;
+          return over >= 5;
+        });
+      }
+      for (const e of found) {
+        keys.push('e' + e.id);
+        if (!first) first = p.elDivs.get(e.id);
       }
     }
     setSel(d, keys);
@@ -1433,7 +1709,7 @@
       $('dlgSign').showModal();
     };
     $('btnWm').onclick = findWatermarks;
-    $('btnOcr').onclick = runOcr;
+    $('btnOcr').onclick = () => runOcr();
     $('chkShow').onchange = ev => {
       state.showEls = ev.target.checked;
       for (const d of state.docs) d.view.classList.toggle('show-els', state.showEls);

@@ -169,13 +169,13 @@
     const texts = doc.pages.map(() => []);
     doc.pages.forEach((p, pi) => {
       for (const el of p.elements) {
-        if (el.kind !== 'text' || el.invisible || el.ocr || el.keys.every(k => doc.deleted.has(k))) continue;
+        if (el.kind !== 'text' || el.invisible || (el.ocr && !el.vector) || el.keys.every(k => doc.deleted.has(k))) continue;
         if (Math.abs(el.vang) > 0.03) continue;
         extra.push(...el.keys);
         texts[pi].push({
           x: el.r[0], y: el.r[1], w: el.r[2], text: doc.edits[el.id] !== undefined ? doc.edits[el.id] : el.text,
           size: el.size,
-          font: el.style.name || WORD_FONT[el.style.family], bold: el.style.bold, italic: el.style.italic,
+          font: el.vector ? 'Arial' : el.style.name || WORD_FONT[el.style.family], bold: el.style.bold, italic: el.style.italic,
           color: el.color
         });
       }
@@ -256,6 +256,7 @@
       edits: doc.edits,
       covered: [...doc.covered],
       ocr: doc.ocr,
+      glyphs: doc.glyphs,
       overlays: doc.overlays,
       images: doc.images
     };
